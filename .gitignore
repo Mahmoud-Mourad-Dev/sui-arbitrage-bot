@@ -1,0 +1,9 @@
+# Sui Move build artifacts
+build/
+
+# Local environment / secrets
+.env
+*.key
+
+# OS files
+.DS_Store
