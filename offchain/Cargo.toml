@@ -1,0 +1,45 @@
+[package]
+name = "arb-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "Off-chain arbitrage scanner & PTB submitter for the arbitrage_system Sui package"
+license = "MIT"
+
+[lib]
+name = "arb_scanner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arb-scanner"
+path = "src/main.rs"
+
+[features]
+# Default build is dependency-light and offline: pure quant core + demo scan.
+default = []
+# `live` pulls the Sui SDK (heavy git deps) and enables WebSocket ingestion,
+# PTB construction, dry-run, and submission. Pin the SDK rev/branch per network.
+live = [
+    "dep:sui-sdk",
+    "dep:sui-json-rpc-types",
+    "dep:sui-types",
+    "dep:shared-crypto",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+]
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# --- live-only (Sui SDK). Optional + git-pinned; not built by default. ---
+sui-sdk = { git = "https://github.com/MystenLabs/sui", branch = "testnet", optional = true }
+sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", branch = "testnet", optional = true }
+sui-types = { git = "https://github.com/MystenLabs/sui", branch = "testnet", optional = true }
+shared-crypto = { git = "https://github.com/MystenLabs/sui", branch = "testnet", optional = true }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }

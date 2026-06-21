@@ -1,9 +1,15 @@
 # Sui Move build artifacts
 build/
 
+# Rust build artifacts
+target/
+**/target/
+
 # Local environment / secrets
 .env
 *.key
+*.keystore
+sui.keystore
 
 # OS files
 .DS_Store
