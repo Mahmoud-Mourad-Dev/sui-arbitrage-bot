@@ -184,6 +184,10 @@ Each phase has an exit gate; do not start the next until it passes.
   (Cetus `pool::calculate_swap_result` / equivalent, via `dev_inspect`) over many
   pools × sizes × directions. **Gate: ≤ 1 unit error** — the same bar amm_v2
   cleared on testnet. Only after this do we trust the engine for a venue.
+  **✅ PASSED for Cetus** — 1,034/1,034 graded quotes across 27 mainnet pools
+  (331 cross-tick, up to 190 crossings) matched **exactly** (max abs error 0).
+  See [cetus-parity-validation.md](cetus-parity-validation.md). Turbos/Kriya-CLMM
+  still pending their own P4 runs.
 - **P5 — swap adapters (the currently deferred part).** Implement
   `cetus_adapter` / `turbos_adapter` / `kriya_adapter` swap calls + wire into the
   PTB builder; keep the dry-run + `settle` gates. Gate: testnet sim==exec per venue.

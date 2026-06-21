@@ -79,6 +79,7 @@ folded into `min_profit`; it is never modeled on-chain.
 - [Testing strategy](docs/TESTING.md)
 - [Testnet validation report](docs/testnet-validation-report.md) — sim == exec proof
 - [External venue readiness audit](docs/external-venue-readiness-audit.md) — Cetus/Turbos/Kriya CLMM pricing, why `x*y=k` fails, the CLMM engine
+- [Cetus parity validation](docs/cetus-parity-validation.md) — engine vs Cetus on-chain quoter: 1,034/1,034 exact across 27 mainnet pools
 
 ## Prerequisites
 

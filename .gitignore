@@ -11,5 +11,12 @@ target/
 *.keystore
 sui.keystore
 
+# Python
+__pycache__/
+*.pyc
+
+# Large regenerable validation output (keep pools_config.json, drop raw results)
+validation/cetus/parity_results.json
+
 # OS files
 .DS_Store
