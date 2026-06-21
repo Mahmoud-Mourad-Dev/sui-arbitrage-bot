@@ -14,6 +14,7 @@
 
 pub mod amm;
 pub mod cache;
+pub mod clmm;
 pub mod config;
 pub mod scanner;
 pub mod types;

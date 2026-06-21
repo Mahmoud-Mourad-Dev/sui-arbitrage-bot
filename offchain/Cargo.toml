@@ -30,6 +30,8 @@ live = [
 [dependencies]
 anyhow = "1"
 thiserror = "1"
+# 256-bit integer for exact CLMM (Q64.64) fixed-point math without overflow.
+primitive-types = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

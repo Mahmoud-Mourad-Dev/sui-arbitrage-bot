@@ -77,6 +77,8 @@ folded into `min_profit`; it is never modeled on-chain.
 - [Gas optimization checklist](docs/GAS_OPTIMIZATION.md)
 - [Security review checklist](docs/SECURITY.md)
 - [Testing strategy](docs/TESTING.md)
+- [Testnet validation report](docs/testnet-validation-report.md) — sim == exec proof
+- [External venue readiness audit](docs/external-venue-readiness-audit.md) — Cetus/Turbos/Kriya CLMM pricing, why `x*y=k` fails, the CLMM engine
 
 ## Prerequisites
 

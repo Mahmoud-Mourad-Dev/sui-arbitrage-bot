@@ -311,6 +311,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "primitive-types 0.12.2",
  "serde",
  "serde_json",
  "shared-crypto",
@@ -2466,6 +2467,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixed-hash"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "835c052cb0c08c1acf6ffd71c022172e18723949c8282f2b9f27efbc51e64534"
+dependencies = [
+ "static_assertions",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4402,7 +4412,7 @@ dependencies = [
  "leb128",
  "move-proc-macros",
  "num",
- "primitive-types",
+ "primitive-types 0.10.1",
  "rand 0.8.6",
  "ref-cast",
  "serde",
@@ -5766,9 +5776,19 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05e4722c697a58a99d5d06a08c30821d7c082a4632198de1eaa5a6c22ef42373"
 dependencies = [
- "fixed-hash",
+ "fixed-hash 0.7.0",
  "impl-codec",
  "impl-serde",
+ "uint",
+]
+
+[[package]]
+name = "primitive-types"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b34d9fd68ae0b74a41b21c03c2f62847aa0ffea044eee893b4c140b37e244e2"
+dependencies = [
+ "fixed-hash 0.8.0",
  "uint",
 ]
 
