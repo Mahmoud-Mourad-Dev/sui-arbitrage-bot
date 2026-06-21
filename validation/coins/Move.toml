@@ -1,0 +1,13 @@
+[package]
+name = "validation_coins"
+edition = "2024.beta"
+license = "MIT"
+
+# Testnet-only helper package: three mintable coins used to seed amm_v2 pools for
+# the testnet validation process. NOT part of the audited arbitrage_system package.
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+
+[addresses]
+validation_coins = "0x0"

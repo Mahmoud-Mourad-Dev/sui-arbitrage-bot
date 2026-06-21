@@ -105,6 +105,14 @@ fn size_route(
     best
 }
 
+/// Simulate a fixed route for a given input using exact AMM math. Public wrapper
+/// over the internal per-hop simulation (used by validation + benchmarks).
+#[must_use]
+pub fn simulate_route(pools: &[PoolState], route: &[Hop], input: u64) -> Option<u64> {
+    let by_id: HashMap<&str, &PoolState> = pools.iter().map(|p| (p.id.as_str(), p)).collect();
+    simulate(&by_id, route, input)
+}
+
 /// Run `input` through every hop using exact AMM math. `None` if any hop fails.
 fn simulate(by_id: &HashMap<&str, &PoolState>, route: &[Hop], input: u64) -> Option<u64> {
     let mut amount = input;
