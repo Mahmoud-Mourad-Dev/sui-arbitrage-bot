@@ -100,6 +100,7 @@ def parse_pool(venue, o):
     if isinstance(owner, dict) and "Shared" in owner:
         isv = int(owner["Shared"]["initial_shared_version"])
     rec = {"venue": venue, "id": d["objectId"], "type_a": ta, "type_b": tb, "isv": isv,
+           "fee_type": targs[2] if len(targs) > 2 else None,  # Turbos Pool<A,B,Fee>
            "sym_a": ta.split("::")[-1], "sym_b": tb.split("::")[-1]}
     if kind == "clmm":
         # Turbos: skip locked pools; Cetus: skip paused pools.
@@ -226,6 +227,7 @@ def build_edges(pools):
                                     "pool": p["id"], "dec_from": dfrm, "dec_to": dto,
                                     "sym_from": frm.split("::")[-1], "sym_to": to.split("::")[-1],
                                     "isv": p["isv"], "type_a": p["type_a"], "type_b": p["type_b"],
+                                    "fee_type": p.get("fee_type"),
                                     "a2b": (frm == p["type_a"]), "kind": p["kind"]}
     return edges
 

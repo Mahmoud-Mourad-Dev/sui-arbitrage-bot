@@ -26,6 +26,7 @@ import bluefin_rpc as bf
 import cetus_rpc as c
 import momentum_rpc as mmt
 import mv_scan as m
+import turbos_rpc as tb
 
 
 MIN_POOL_USD = 5000  # ignore pools with < ~$5k on the hub side (thin/artifact prices)
@@ -73,6 +74,10 @@ def dryrun_cycle(cyc, amount_native):
             x = float(mmt.quote(e["pool"], e["isv"], e["type_a"], e["type_b"], e["a2b"], int(x)))
         elif e["venue"] == "bluefin" and e.get("isv"):
             x = float(bf.quote(e["pool"], e["isv"], e["type_a"], e["type_b"], e["a2b"], int(x)))
+        elif e["venue"] == "turbos" and e.get("isv") and e.get("fee_type"):
+            # authoritative Turbos pricing (pool_fetcher); replaces the prior
+            # single-range engine estimate that overestimated multi-tick swaps
+            x = float(tb.quote_exact_in(e["pool"], e["isv"], e["type_a"], e["type_b"], e["fee_type"], e["a2b"], int(x)))
         elif e["venue"] == "kriya":
             x = m.cp_out(x, e["rin"], e["rout"], e["fee"])  # exact CP == Kriya invariant
         else:  # turbos (or cetus missing isv): engine single-range estimate

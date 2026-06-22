@@ -83,6 +83,8 @@ folded into `min_profit`; it is never modeled on-chain.
 - [DeepBook + Aftermath study](docs/deepbook-aftermath-study.md) — next-gen market graph: native CLOB (parity PASS) + aggregator oracle, read-only
 - [Momentum integration & study](docs/momentum-study.md) — Momentum CLMM read-only: discovery, authoritative quoter, parity PASS (<0.1%), integrated
 - [Bluefin integration & study](docs/bluefin-study.md) — Bluefin Spot CLMM read-only: parity PASS (0.031%), integrated; most-active new venue (WAL surface)
+- [Turbos parity research](docs/turbos-parity-research.md) — on-chain Turbos package/pool/quoter facts (friend fn → public `pool_fetcher`)
+- [Turbos parity report](docs/turbos-parity-report.md) — engine vs authoritative: in-range PASS, multi-tick FAIL; does the 94%-Turbos profit survive?
 
 ## Prerequisites
 
