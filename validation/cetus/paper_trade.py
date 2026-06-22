@@ -22,6 +22,7 @@ import os
 import sys
 import time
 
+import bluefin_rpc as bf
 import cetus_rpc as c
 import momentum_rpc as mmt
 import mv_scan as m
@@ -70,6 +71,8 @@ def dryrun_cycle(cyc, amount_native):
             x = float(q["amount_out"])
         elif e["venue"] == "momentum" and e.get("isv"):
             x = float(mmt.quote(e["pool"], e["isv"], e["type_a"], e["type_b"], e["a2b"], int(x)))
+        elif e["venue"] == "bluefin" and e.get("isv"):
+            x = float(bf.quote(e["pool"], e["isv"], e["type_a"], e["type_b"], e["a2b"], int(x)))
         elif e["venue"] == "kriya":
             x = m.cp_out(x, e["rin"], e["rout"], e["fee"])  # exact CP == Kriya invariant
         else:  # turbos (or cetus missing isv): engine single-range estimate

@@ -31,6 +31,8 @@ VENUES = {
               "module": "spot_dex", "kind": "amm"},
     "momentum": {"pkg": "0x70285592c97965e811e0c6f98dccc3a9c2b4ad854b3594faab9597ada267b860",
                  "module": "trade", "kind": "clmm"},
+    "bluefin": {"pkg": "0x3492c874c1e3b3e2984e8c41b589e642d4d0a5d6459e5a9cfc2d52fd7c89c267",
+                "module": "events", "kind": "clmm"},
 }
 
 _dec_cache = {}
@@ -101,7 +103,7 @@ def parse_pool(venue, o):
            "sym_a": ta.split("::")[-1], "sym_b": tb.split("::")[-1]}
     if kind == "clmm":
         # Turbos: skip locked pools; Cetus: skip paused pools.
-        if f.get("unlocked") is False or f.get("is_pause") is True:
+        if f.get("unlocked") is False or f.get("is_pause") is True or f.get("is_paused") is True:
             return None
         dec_a, dec_b = coin_decimals(ta), coin_decimals(tb)
         if dec_a is None or dec_b is None:

@@ -82,6 +82,7 @@ folded into `min_profit`; it is never modeled on-chain.
 - [Cetus parity validation](docs/cetus-parity-validation.md) — engine vs Cetus on-chain quoter: 1,034/1,034 exact across 27 mainnet pools
 - [DeepBook + Aftermath study](docs/deepbook-aftermath-study.md) — next-gen market graph: native CLOB (parity PASS) + aggregator oracle, read-only
 - [Momentum integration & study](docs/momentum-study.md) — Momentum CLMM read-only: discovery, authoritative quoter, parity PASS (<0.1%), integrated
+- [Bluefin integration & study](docs/bluefin-study.md) — Bluefin Spot CLMM read-only: parity PASS (0.031%), integrated; most-active new venue (WAL surface)
 
 ## Prerequisites
 
