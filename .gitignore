@@ -15,8 +15,11 @@ sui.keystore
 __pycache__/
 *.pyc
 
-# Large regenerable validation output (keep pools_config.json, drop raw results)
+# Large regenerable validation output (keep .py + small configs, drop raw logs)
 validation/cetus/parity_results.json
+validation/cetus/*.jsonl
+validation/cetus/*.log
+validation/cetus/mv_pools.json
 
 # OS files
 .DS_Store
