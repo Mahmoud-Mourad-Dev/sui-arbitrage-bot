@@ -29,6 +29,8 @@ VENUES = {
                "module": "pool", "kind": "clmm"},
     "kriya": {"pkg": "0xa0eba10b173538c8fecca1dff298e488402cc9ff374f8a12ca7758eebe830b66",
               "module": "spot_dex", "kind": "amm"},
+    "momentum": {"pkg": "0x70285592c97965e811e0c6f98dccc3a9c2b4ad854b3594faab9597ada267b860",
+                 "module": "trade", "kind": "clmm"},
 }
 
 _dec_cache = {}
@@ -107,7 +109,7 @@ def parse_pool(venue, o):
         sp = int(f.get("current_sqrt_price") or f.get("sqrt_price"))
         s = sp / 2 ** 64
         price_b_per_a = s * s * 10 ** (dec_a - dec_b)  # whole token_b per whole token_a
-        fee = int(f["fee_rate"] if "fee_rate" in f else f["fee"]) / 1_000_000.0
+        fee = int(f.get("fee_rate") or f.get("fee") or f.get("swap_fee_rate")) / 1_000_000.0
         liq = int(f["liquidity"])
         rec.update(dec_a=dec_a, dec_b=dec_b, price=price_b_per_a, fee=fee, depth=liq, kind="clmm")
     else:  # kriya amm

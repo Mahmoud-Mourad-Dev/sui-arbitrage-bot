@@ -81,6 +81,7 @@ folded into `min_profit`; it is never modeled on-chain.
 - [External venue readiness audit](docs/external-venue-readiness-audit.md) — Cetus/Turbos/Kriya CLMM pricing, why `x*y=k` fails, the CLMM engine
 - [Cetus parity validation](docs/cetus-parity-validation.md) — engine vs Cetus on-chain quoter: 1,034/1,034 exact across 27 mainnet pools
 - [DeepBook + Aftermath study](docs/deepbook-aftermath-study.md) — next-gen market graph: native CLOB (parity PASS) + aggregator oracle, read-only
+- [Momentum integration & study](docs/momentum-study.md) — Momentum CLMM read-only: discovery, authoritative quoter, parity PASS (<0.1%), integrated
 
 ## Prerequisites
 
