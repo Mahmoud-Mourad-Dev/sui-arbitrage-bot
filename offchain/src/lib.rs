@@ -16,12 +16,12 @@ pub mod amm;
 pub mod cache;
 pub mod clmm;
 pub mod config;
+pub mod flashloan;
+pub mod ptb;
 pub mod scanner;
 pub mod types;
 
 #[cfg(feature = "live")]
 pub mod executor;
-#[cfg(feature = "live")]
-pub mod ptb;
 #[cfg(feature = "live")]
 pub mod ws;

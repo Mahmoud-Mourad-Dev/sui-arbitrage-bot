@@ -55,6 +55,7 @@ fn main() {
             100_000_000_000,
         ],
         gas_cost,
+        flash_fee_bps: 0,
         min_profit: 1,
     };
 

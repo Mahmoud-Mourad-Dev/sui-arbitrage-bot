@@ -61,6 +61,7 @@ fn run_demo(config: &Config, cache: &ReserveCache) {
         max_hops: config.max_hops,
         candidate_inputs: vec![1_000_000, 5_000_000, 10_000_000, 50_000_000, 100_000_000],
         gas_cost: config.gas_cost_estimate,
+        flash_fee_bps: 0,
         min_profit: 1,
     };
 
@@ -116,6 +117,7 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
             max_hops: config.max_hops,
             candidate_inputs: config.candidate_inputs.clone(),
             gas_cost: config.gas_cost_estimate,
+            flash_fee_bps: config.flash_fee_bps,
             min_profit: config.min_profit,
         };
         if let Some(opp) = scanner::find_best(&pools, &params) {

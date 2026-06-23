@@ -30,6 +30,9 @@ pub struct Opportunity {
     pub input_amount: u64,
     pub output_amount: u64,
     pub gross_profit: u64,
+    /// Flash-loan fee charged on `input_amount` (0 when trading owned capital).
+    pub flash_fee: u64,
+    /// gross_profit − gas_cost − flash_fee.
     pub net_profit: u64,
 }
 
@@ -42,6 +45,11 @@ pub struct ScanParams {
     pub candidate_inputs: Vec<u64>,
     /// Estimated gas cost of the whole PTB, charged against gross profit.
     pub gas_cost: u64,
+    /// Flash-loan fee in bps charged on the input/loan size. 0 = owned capital
+    /// (no flash loan). When > 0, `input_amount` is the borrowed amount and the
+    /// fee is subtracted from profit so routes that only clear without the loan
+    /// fee are rejected.
+    pub flash_fee_bps: u64,
     /// Minimum net profit to report an opportunity.
     pub min_profit: u64,
 }
@@ -88,7 +96,15 @@ fn size_route(
             continue;
         }
         let gross_profit = output - input;
-        let net_profit = gross_profit.saturating_sub(params.gas_cost);
+        // Borrowed capital: you owe input + flash_fee, so profit nets the fee too.
+        let flash_fee = if params.flash_fee_bps > 0 {
+            crate::flashloan::quote_fee_bps(input, params.flash_fee_bps)
+        } else {
+            0
+        };
+        let net_profit = gross_profit
+            .saturating_sub(params.gas_cost)
+            .saturating_sub(flash_fee);
         if net_profit < params.min_profit {
             continue;
         }
@@ -98,6 +114,7 @@ fn size_route(
                 input_amount: input,
                 output_amount: output,
                 gross_profit,
+                flash_fee,
                 net_profit,
             });
         }
@@ -238,6 +255,7 @@ mod tests {
             max_hops: 3,
             candidate_inputs: vec![1, 2, 5, 10, 20, 50, 100],
             gas_cost: 0,
+            flash_fee_bps: 0,
             min_profit: 1,
         };
         let opp = find_best(&pools, &params).expect("should find an opportunity");
@@ -261,6 +279,7 @@ mod tests {
             max_hops: 3,
             candidate_inputs: vec![1, 10, 100, 1_000, 10_000],
             gas_cost: 0,
+            flash_fee_bps: 0,
             min_profit: 1,
         };
         assert!(find_best(&pools, &params).is_none());
@@ -278,8 +297,51 @@ mod tests {
             max_hops: 3,
             candidate_inputs: vec![1, 2, 5, 10],
             gas_cost: 1_000_000, // dwarfs any micro-spread profit here
+            flash_fee_bps: 0,
             min_profit: 1,
         };
         assert!(find_best(&pools, &params).is_none());
+    }
+
+    #[test]
+    fn flash_fee_is_subtracted_and_can_reject_routes() {
+        // The C~2A triangle: ~5 profit on input 10 with no fee.
+        let pools = vec![
+            pool("0xAB", "A", "B", 1_000, 1_000),
+            pool("0xBC", "B", "C", 1_000, 1_000),
+            pool("0xCA", "C", "A", 1_000, 2_000),
+        ];
+        let base = ScanParams {
+            base_token: "A".into(),
+            max_hops: 3,
+            candidate_inputs: vec![10],
+            gas_cost: 0,
+            flash_fee_bps: 0,
+            min_profit: 1,
+        };
+        let no_fee = find_best(&pools, &base).expect("profitable without fee");
+        assert_eq!(no_fee.flash_fee, 0);
+
+        // With a flash fee, the same route nets less by exactly the fee.
+        let with_fee = find_best(
+            &pools,
+            &ScanParams {
+                flash_fee_bps: 30,
+                ..base.clone()
+            },
+        )
+        .expect("still profitable after a small fee");
+        assert_eq!(with_fee.flash_fee, crate::flashloan::quote_fee_bps(10, 30));
+        assert_eq!(with_fee.net_profit, no_fee.net_profit - with_fee.flash_fee);
+
+        // A punitive fee (50%) makes the thin micro-spread unprofitable -> rejected.
+        let killed = find_best(
+            &pools,
+            &ScanParams {
+                flash_fee_bps: 5_000,
+                ..base
+            },
+        );
+        assert!(killed.is_none());
     }
 }

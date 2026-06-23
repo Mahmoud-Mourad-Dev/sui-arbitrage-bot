@@ -44,6 +44,7 @@ fn params() -> ScanParams {
             100_000_000_000,
         ],
         gas_cost: 8_000_000,
+        flash_fee_bps: 0,
         min_profit: 1,
     }
 }

@@ -28,6 +28,14 @@ pub struct Config {
     pub candidate_inputs: Vec<u64>,
     /// Re-scan cadence when not event-driven (ms).
     pub poll_interval_ms: u64,
+    /// Flash-loan execution: borrow the input capital instead of using owned funds.
+    pub flash_enabled: bool,
+    /// Provider name resolved by `flashloan::provider_from` (e.g. "mock").
+    pub flash_provider: String,
+    /// Flash-loan fee in bps, charged on the loan size and netted from profit.
+    pub flash_fee_bps: u64,
+    /// Shared lender/vault object id passed to borrow/repay.
+    pub flash_lender_id: String,
 }
 
 impl Config {
@@ -43,6 +51,10 @@ impl Config {
             max_hops: env_parse("ARB_MAX_HOPS", 3)?,
             candidate_inputs: env_inputs(),
             poll_interval_ms: env_parse("ARB_POLL_MS", 500)?,
+            flash_enabled: env_parse("ARB_FLASH_ENABLED", false)?,
+            flash_provider: env_or("ARB_FLASH_PROVIDER", "mock"),
+            flash_fee_bps: env_parse("ARB_FLASH_FEE_BPS", 0)?,
+            flash_lender_id: env_or("ARB_FLASH_LENDER_ID", "0x0"),
         })
     }
 }
