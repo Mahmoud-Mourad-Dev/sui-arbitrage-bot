@@ -373,6 +373,8 @@ mod live {
     ///   - Turbos: `swap_*<A,B,FeeType>(pool, coin, min_out, clock, versioned, ctx)`
     pub struct ResolvedHop {
         pub dex: Dex,
+        /// True if collateral/token_in is the pool's `token_a` (selects swap fn direction).
+        pub a_to_b: bool,
         /// Mutable shared pool object.
         pub pool: ObjectArg,
         /// `[token_a, token_b]` for V2/Cetus; `[token_a, token_b, fee_type]` for Turbos.
@@ -399,7 +401,7 @@ mod live {
     }
 
     fn id(s: &str) -> Result<Identifier> {
-        Ok(Identifier::new(s)?)
+        Identifier::new(s) // already returns anyhow::Result<Identifier>
     }
 
     /// Assemble the flash-arb PTB. `plan` orders the steps; `inputs` carries the

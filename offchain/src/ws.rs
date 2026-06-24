@@ -90,7 +90,7 @@ pub async fn bootstrap_pools(
         .await?;
 
     let mut n = 0;
-    for (t, obj) in tracked.iter().zip(objs.into_iter()) {
+    for (t, obj) in tracked.iter().zip(objs) {
         match decode_pool(t.dex, &obj) {
             Ok((state, lref)) => {
                 cache.upsert(state);
@@ -217,7 +217,7 @@ fn decode_pool(
     let Some(SuiParsedData::MoveObject(mv)) = &data.content else {
         return Err(anyhow!("no move content"));
     };
-    let fields = mv.fields.to_json_value();
+    let fields = mv.fields.clone().to_json_value(); // to_json_value consumes self
 
     let sqrt_price: u128 = json_u128(&fields, "current_sqrt_price")?;
     let liquidity: u128 = json_u128(&fields, "liquidity")?;

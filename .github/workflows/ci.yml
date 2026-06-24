@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Build + lint BOTH feature sets so the live path can never silently stop compiling
+  # (the pre-mainnet audit found `--features live` broken while the default build was green).
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: offchain
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features live"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: offchain
+      - name: clippy
+        run: cargo clippy ${{ matrix.features }} --all-targets -- -D warnings
+      - name: build
+        run: cargo build ${{ matrix.features }}
+      - name: test
+        run: cargo test ${{ matrix.features }}
+      - name: fmt (offline matrix leg only)
+        if: matrix.features == ''
+        run: cargo fmt --check
+
+  move:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install sui
+        run: |
+          curl -fsSL https://github.com/MystenLabs/sui/releases/latest/download/sui-mainnet-$(uname -s)-$(uname -m).tgz -o sui.tgz 2>/dev/null || true
+          # Fallback: install via cargo if no prebuilt asset matches the runner.
+          which sui || cargo install --locked --git https://github.com/MystenLabs/sui.git --rev ff1fe0ec455153707136cffd0dc77dfb77ba9ad5 sui
+      - name: move test
+        run: sui move test

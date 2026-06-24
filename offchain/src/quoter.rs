@@ -18,7 +18,7 @@ use sui_json_rpc_types::SuiTransactionBlockEffectsAPI;
 use sui_sdk::SuiClient;
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::transaction::{Command, ObjectArg, TransactionKind};
+use sui_types::transaction::{Command, ObjectArg, SharedObjectMutability, TransactionKind};
 use sui_types::TypeTag;
 
 use crate::types::Dex;
@@ -108,7 +108,7 @@ async fn cetus_quote(
     let pool_arg = ptb.obj(ObjectArg::SharedObject {
         id: pool.pool_id,
         initial_shared_version: pool.init_shared_version,
-        mutable: false,
+        mutability: SharedObjectMutability::Immutable,
     })?;
     let a2b_arg = ptb.pure(a2b)?;
     let by_in_arg = ptb.pure(true)?;
@@ -142,7 +142,7 @@ async fn turbos_quote(
     let pool_arg = ptb.obj(ObjectArg::SharedObject {
         id: pool.pool_id,
         initial_shared_version: pool.init_shared_version,
-        mutable: false,
+        mutability: SharedObjectMutability::Immutable,
     })?;
     let a2b_arg = ptb.pure(a2b)?;
     let by_in_arg = ptb.pure(true)?;
@@ -151,7 +151,7 @@ async fn turbos_quote(
     let clock_arg = ptb.obj(ObjectArg::SharedObject {
         id: ObjectID::from_hex_literal("0x6")?,
         initial_shared_version: SequenceNumber::from_u64(1),
-        mutable: false,
+        mutability: SharedObjectMutability::Immutable,
     })?;
     ptb.command(Command::move_call(
         TURBOS_PKG.parse::<ObjectID>()?,
@@ -187,10 +187,9 @@ async fn dev_inspect_first_return(
             None,
         )
         .await?;
-    if let Some(effects) = &res.effects {
-        if effects.status().is_err() {
-            return Err(anyhow!("devInspect reverted: {:?}", effects.status()));
-        }
+    let effects = &res.effects;
+    if effects.status().is_err() {
+        return Err(anyhow!("devInspect reverted: {:?}", effects.status()));
     }
     let results = res
         .results

@@ -42,18 +42,18 @@ pub async fn scallop_price(
     use sui_json_rpc_types::SuiTransactionBlockEffectsAPI;
     use sui_types::base_types::{ObjectID, SequenceNumber};
     use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-    use sui_types::transaction::{Command, ObjectArg, TransactionKind};
+    use sui_types::transaction::{Command, ObjectArg, SharedObjectMutability, TransactionKind};
 
     let mut ptb = ProgrammableTransactionBuilder::new();
     let oracle = ptb.obj(ObjectArg::SharedObject {
         id: x_oracle_id.parse()?,
         initial_shared_version: SequenceNumber::from_u64(x_oracle_init_version),
-        mutable: false,
+        mutability: SharedObjectMutability::Immutable,
     })?;
     let clock = ptb.obj(ObjectArg::SharedObject {
         id: ObjectID::from_hex_literal("0x6")?,
         initial_shared_version: SequenceNumber::from_u64(1),
-        mutable: false,
+        mutability: SharedObjectMutability::Immutable,
     })?;
     ptb.command(Command::move_call(
         package.parse::<ObjectID>()?,
@@ -72,10 +72,9 @@ pub async fn scallop_price(
             None,
         )
         .await?;
-    if let Some(effects) = &res.effects {
-        if effects.status().is_err() {
-            return Err(anyhow!("price get_price reverted: {:?}", effects.status()));
-        }
+    let effects = &res.effects;
+    if effects.status().is_err() {
+        return Err(anyhow!("price get_price reverted: {:?}", effects.status()));
     }
     // Scallop's price is a FixedPoint32 (u64 fraction). Decode + scale to f64.
     let results = res.results.ok_or_else(|| anyhow!("no results"))?;

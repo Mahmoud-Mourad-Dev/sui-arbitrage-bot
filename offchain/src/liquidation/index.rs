@@ -74,9 +74,30 @@ pub async fn run(config: &Config, index: &ObligationIndex) -> Result<()> {
         .ws_url(&config.ws_url)
         .build(&config.rpc_url)
         .await?;
-    let filter = EventFilter::Package(SCALLOP_PKG.parse()?);
+    // No single "whole package" event filter in this SDK; subscribe to the obligation
+    // lifecycle modules (each emits events carrying the obligation id).
+    let pkg = SCALLOP_PKG.parse()?;
+    let modules = [
+        "open_obligation",
+        "deposit_collateral",
+        "borrow",
+        "repay",
+        "withdraw_collateral",
+        "liquidate",
+    ];
+    let filter = EventFilter::Any(
+        modules
+            .iter()
+            .map(|m| {
+                Ok(EventFilter::MoveModule {
+                    package: pkg,
+                    module: m.parse()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
     let mut stream = client.event_api().subscribe_event(filter).await?;
-    tracing::info!("obligation index: subscribed to Scallop events");
+    tracing::info!("obligation index: subscribed to Scallop lifecycle events");
 
     while let Some(ev) = stream.next().await {
         let ev = ev?;
