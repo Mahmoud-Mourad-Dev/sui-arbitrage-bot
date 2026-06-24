@@ -167,7 +167,11 @@ async fn build_ptb(
     let pkg: ObjectID = config.package_id.parse().context("ARB_PACKAGE_ID")?;
 
     if opp.kind == OppKind::Liquidation {
-        bail!("liquidation PTB assembly wired in Phase 3 (Pyth update) — not built here");
+        // `ptb::build_liquidation` (with the in-PTB Pyth/x_oracle refresh) exists and is
+        // plan-tested; resolving its full oracle object set (pyth_state, pyth_registry,
+        // per-feed PriceInfoObjects, x_oracle/rule packages) + the runtime submit is the
+        // Phase-5 testnet step.
+        bail!("liquidation submit assembly is the Phase-5 step; build_liquidation is wired + plan-tested");
     }
 
     // Flash-arb path (ptb::live::build): borrow → begin → swaps → settle_and_return → repay.

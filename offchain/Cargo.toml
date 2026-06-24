@@ -26,6 +26,7 @@ live = [
     "dep:shared-crypto",
     "dep:tokio-tungstenite",
     "dep:futures-util",
+    "dep:reqwest",
 ]
 
 [dependencies]
@@ -45,5 +46,6 @@ sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet
 sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 sui-keys = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 shared-crypto = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }

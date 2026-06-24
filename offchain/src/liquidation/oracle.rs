@@ -13,7 +13,7 @@
 //! VERIFICATION STATUS: written against the live SDK + Hermes; compiles under
 //! `--features live`; not built/run in offline CI here.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 
 /// A price reading from the protocol's oracle.
 #[derive(Clone, Copy, Debug)]
@@ -96,13 +96,27 @@ pub async fn scallop_price(
     })
 }
 
-/// Fetch a Pyth price-update VAA from Hermes (for protocols requiring an in-PTB update).
+/// Fetch the Pyth price-update bytes from Hermes for `price_id_hex` (the accumulator
+/// update consumed on-chain by `pyth::update_single_price_feed`). The liquidation PTB
+/// builder turns these bytes into the in-band Pyth update before Scallop's
+/// `pyth_rule::set_price_as_primary` + `liquidate`.
 pub async fn fetch_pyth_vaa(hermes_url: &str, price_id_hex: &str) -> Result<Vec<u8>> {
-    // GET {hermes}/v2/updates/price/latest?ids[]=<price_id> → base64 VAA. The caller
-    // turns this into a `pyth::pyth::update_price_feeds` command in the liquidation PTB.
-    let url = format!("{hermes_url}/v2/updates/price/latest?ids[]={price_id_hex}");
-    let _ = url;
-    Err(anyhow!(
-        "wire an HTTP client (reqwest) to fetch the Hermes VAA"
-    ))
+    let base = hermes_url.trim_end_matches('/');
+    let url = format!("{base}/v2/updates/price/latest?ids[]={price_id_hex}&encoding=hex");
+    let resp: serde_json::Value = reqwest::get(&url).await?.error_for_status()?.json().await?;
+    let hexstr = resp["binary"]["data"][0]
+        .as_str()
+        .ok_or_else(|| anyhow!("Hermes response missing binary.data[0]"))?;
+    decode_hex(hexstr)
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if !s.len().is_multiple_of(2) {
+        bail!("odd-length hex from Hermes");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
 }

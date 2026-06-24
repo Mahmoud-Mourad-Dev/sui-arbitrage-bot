@@ -41,6 +41,11 @@ pub enum PtbStep {
         pool_id: String,
         min_out: u64,
     },
+    /// In-band oracle refresh required before a liquidation reads the protocol's price.
+    /// For Scallop this expands to, per `feed`: `pyth::update_single_price_feed` (fresh
+    /// `PriceInfoObject`, paid) → `x_oracle::price_update_request` →
+    /// `pyth_rule::set_price_as_primary` → `x_oracle::confirm_price_update_request`.
+    PriceUpdate { feeds: Vec<String> },
     /// `<protocol>::liquidate(...)` → (remain debt coin, seized collateral coin). The
     /// seized collateral is then swapped back to the debt asset by the following hops.
     Liquidate {
@@ -109,7 +114,13 @@ pub fn liquidation_plan(
         .liquidation
         .as_ref()
         .expect("liquidation opportunity must carry a LiquidationLeg");
-    let mut steps = Vec::with_capacity(opp.route.len() + 5);
+    let mut steps = Vec::with_capacity(opp.route.len() + 6);
+    // Oracle MUST be refreshed in-band before liquidate reads it (Scallop x_oracle is
+    // Pyth-backed and staleness-checked). The assets whose price liquidate reads are the
+    // debt + collateral of the leg.
+    steps.push(PtbStep::PriceUpdate {
+        feeds: vec![leg.debt_type.clone(), leg.collateral_type.clone()],
+    });
     if let Some(p) = provider {
         steps.push(PtbStep::FlashBorrow {
             call: p.borrow_call(),
@@ -303,28 +314,33 @@ mod tests {
     fn flash_liquidation_plan_shape() {
         let p = MockProvider::new("0xpkg", "0xlender", 30);
         let plan = liquidation_plan(Some(&p), &liq_opp(), 8_000);
-        // borrow → begin → liquidate → swap → settle_and_return → repay → transfer
+        // price update → borrow → begin → liquidate → swap → settle_and_return → repay → transfer
+        assert!(matches!(plan[0], PtbStep::PriceUpdate { .. }));
         assert!(matches!(
-            plan[0],
+            plan[1],
             PtbStep::FlashBorrow {
                 amount: 200_000_000,
                 ..
             }
         ));
-        assert!(matches!(plan[1], PtbStep::Begin { .. }));
+        assert!(matches!(plan[2], PtbStep::Begin { .. }));
         assert!(matches!(
-            plan[2],
+            plan[3],
             PtbStep::Liquidate {
                 protocol: Protocol::Scallop,
                 ..
             }
         ));
-        assert!(matches!(plan[3], PtbStep::Swap { .. }));
-        assert!(matches!(plan[4], PtbStep::SettleAndReturn));
-        assert!(matches!(plan[5], PtbStep::FlashRepay { .. }));
-        assert!(matches!(plan[6], PtbStep::TransferToSender));
-        assert_eq!(plan.len(), 7);
-        // liquidate precedes the swap-back which precedes the profit gate
+        assert!(matches!(plan[4], PtbStep::Swap { .. }));
+        assert!(matches!(plan[5], PtbStep::SettleAndReturn));
+        assert!(matches!(plan[6], PtbStep::FlashRepay { .. }));
+        assert!(matches!(plan[7], PtbStep::TransferToSender));
+        assert_eq!(plan.len(), 8);
+        // THE ordering the oracle correctness depends on: update → liquidate → settle → repay
+        let upd = plan
+            .iter()
+            .position(|s| matches!(s, PtbStep::PriceUpdate { .. }))
+            .unwrap();
         let liq = plan
             .iter()
             .position(|s| matches!(s, PtbStep::Liquidate { .. }))
@@ -337,14 +353,19 @@ mod tests {
             .iter()
             .position(|s| matches!(s, PtbStep::SettleAndReturn))
             .unwrap();
-        assert!(liq < swap && swap < settle);
+        let repay = plan
+            .iter()
+            .position(|s| matches!(s, PtbStep::FlashRepay { .. }))
+            .unwrap();
+        assert!(upd < liq && liq < swap && swap < settle && settle < repay);
     }
 
     #[test]
     fn owned_liquidation_plan_has_no_flash_and_ends_at_settle() {
         let plan = liquidation_plan(None, &liq_opp(), 1);
-        assert!(matches!(plan.first(), Some(PtbStep::Begin { .. })));
-        assert!(matches!(plan[1], PtbStep::Liquidate { .. }));
+        assert!(matches!(plan.first(), Some(PtbStep::PriceUpdate { .. })));
+        assert!(matches!(plan[1], PtbStep::Begin { .. }));
+        assert!(matches!(plan[2], PtbStep::Liquidate { .. }));
         assert!(matches!(plan.last(), Some(PtbStep::Settle)));
         assert!(!plan
             .iter()
@@ -524,8 +545,17 @@ mod live {
         pub obligation: ObjectArg, // shared, mutable
         pub market: ObjectArg,     // shared, mutable (flash + liquidate share it)
         pub registry: ObjectArg,   // CoinDecimalsRegistry
-        pub x_oracle: ObjectArg,
+        pub x_oracle: ObjectArg,   // shared, MUTABLE (confirm_price_update_request)
         pub clock: ObjectArg,
+        // --- oracle refresh (Scallop x_oracle pyth_rule), verified signatures ---
+        pub x_oracle_package: ObjectID,
+        pub pyth_rule_package: ObjectID,
+        pub pyth_state: ObjectArg,
+        pub pyth_registry: ObjectArg,
+        /// Fresh Pyth `PriceInfoObject`s for the debt + collateral feeds (updated from
+        /// the Hermes bytes earlier in the PTB — see the doc on `build_liquidation`).
+        pub debt_price_info: ObjectArg,
+        pub collateral_price_info: ObjectArg,
         pub repay_amount: u64,
         /// repay_amount + flash fee, split off `proceeds` to repay the loan exactly.
         pub repay_total: u64,
@@ -548,6 +578,49 @@ mod live {
         }
         let mut ptb = ProgrammableTransactionBuilder::new();
         let debt = vec![inputs.debt_type.clone()];
+
+        // 0. Oracle refresh — MUST precede liquidate (Scallop x_oracle is Pyth-backed and
+        //    staleness-checked). Per asset, the VERIFIED Scallop flow:
+        //      req = x_oracle::price_update_request<Coin>(x_oracle)
+        //      pyth_rule::rule::set_price_as_primary<Coin>(req, pyth_state, price_info, pyth_registry, clock)
+        //      x_oracle::confirm_price_update_request<Coin>(x_oracle, req, clock)
+        //    This threads the real `PriceInfoObject` for each feed. PREREQUISITE: those
+        //    PriceInfoObjects must be freshly updated via `pyth::update_single_price_feed`
+        //    (verified sig) fed by `oracle::fetch_pyth_vaa` bytes; the accumulator ->
+        //    HotPotatoVector constructor is the single call to confirm on-chain at Phase 5,
+        //    so it is intentionally NOT fabricated here (reality-check protocol).
+        let oracle_x = ptb.obj(inputs.x_oracle)?;
+        let oracle_clock = ptb.obj(inputs.clock)?;
+        let pyth_state = ptb.obj(inputs.pyth_state)?;
+        let pyth_registry = ptb.obj(inputs.pyth_registry)?;
+        for (coin_ty, price_info_obj) in [
+            (inputs.debt_type.clone(), inputs.debt_price_info),
+            (inputs.collateral_type.clone(), inputs.collateral_price_info),
+        ] {
+            let price_info = ptb.obj(price_info_obj)?;
+            let ta = vec![coin_ty];
+            let req = ptb.command(Command::move_call(
+                inputs.x_oracle_package,
+                id("x_oracle")?,
+                id("price_update_request")?,
+                ta.clone(),
+                vec![oracle_x],
+            ));
+            ptb.command(Command::move_call(
+                inputs.pyth_rule_package,
+                id("rule")?,
+                id("set_price_as_primary")?,
+                ta.clone(),
+                vec![req, pyth_state, price_info, pyth_registry, oracle_clock],
+            ));
+            ptb.command(Command::move_call(
+                inputs.x_oracle_package,
+                id("x_oracle")?,
+                id("confirm_price_update_request")?,
+                ta,
+                vec![oracle_x, req, oracle_clock],
+            ));
+        }
 
         // 1. Scallop flash: borrow_flash_loan<Debt>(version, market, amount) -> (Coin, FlashLoan)
         let version = ptb.obj(inputs.version)?;
