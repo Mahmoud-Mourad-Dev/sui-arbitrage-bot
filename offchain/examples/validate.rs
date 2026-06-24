@@ -9,33 +9,33 @@ use arb_scanner::types::{Dex, PoolState};
 
 fn main() {
     let pools = vec![
-        PoolState {
-            id: "AB".into(),
-            dex: Dex::AmmV2,
-            token_a: "A".into(),
-            token_b: "B".into(),
-            reserve_a: 1_000_000_000_000,
-            reserve_b: 1_000_000_000_000,
-            fee_bps: 30,
-        },
-        PoolState {
-            id: "BC".into(),
-            dex: Dex::AmmV2,
-            token_a: "B".into(),
-            token_b: "C".into(),
-            reserve_a: 1_000_000_000_000,
-            reserve_b: 1_000_000_000_000,
-            fee_bps: 30,
-        },
-        PoolState {
-            id: "CA".into(),
-            dex: Dex::AmmV2,
-            token_a: "C".into(),
-            token_b: "A".into(),
-            reserve_a: 1_000_000_000_000,
-            reserve_b: 2_000_000_000_000,
-            fee_bps: 30,
-        },
+        PoolState::v2(
+            "AB",
+            Dex::AmmV2,
+            "A",
+            "B",
+            1_000_000_000_000,
+            1_000_000_000_000,
+            30,
+        ),
+        PoolState::v2(
+            "BC",
+            Dex::AmmV2,
+            "B",
+            "C",
+            1_000_000_000_000,
+            1_000_000_000_000,
+            30,
+        ),
+        PoolState::v2(
+            "CA",
+            Dex::AmmV2,
+            "C",
+            "A",
+            1_000_000_000_000,
+            2_000_000_000_000,
+            30,
+        ),
     ];
 
     let gas_cost: u64 = std::env::var("GAS")

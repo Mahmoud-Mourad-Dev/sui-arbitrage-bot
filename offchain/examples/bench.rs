@@ -19,15 +19,7 @@ fn pools() -> Vec<PoolState> {
 }
 
 fn mk(id: &str, a: &str, b: &str, ra: u64, rb: u64) -> PoolState {
-    PoolState {
-        id: id.into(),
-        dex: Dex::AmmV2,
-        token_a: a.into(),
-        token_b: b.into(),
-        reserve_a: ra,
-        reserve_b: rb,
-        fee_bps: 30,
-    }
+    PoolState::v2(id, Dex::AmmV2, a, b, ra, rb, 30)
 }
 
 fn params() -> ScanParams {

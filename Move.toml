@@ -5,14 +5,19 @@ license = "MIT"
 # authors = ["Mahmoud Mourad <mahmoud.mourad.dev@gmail.com>"]
 
 [dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+# Target network = mainnet (where the CLMM parity + PnL signal were measured, and
+# where the Cetus/Turbos packages below live). See docs/consolidation-plan.md.
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/mainnet", override = true }
+MoveStdlib = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/move-stdlib", rev = "framework/mainnet", override = true }
 
-# AMM integrations (uncomment + pin the published rev/address per network when
-# wiring the live adapters in sources/adapters/). Keeping them out of the default
-# build means `sui move build` stays fast and dependency-free for the executor.
-#
-# CetusClmm = { git = "https://github.com/CetusProtocol/cetus-clmm-interface.git", subdir = "sui/clmmpool", rev = "<pin>" }
-# Turbos    = { git = "https://github.com/turbos-finance/turbos-sui-move-interface.git", subdir = "...", rev = "<pin>" }
+# Cetus CLMM interface — provides pool::flash_swap / repay_flash_swap that
+# cetus_adapter wraps. Pinned to a mainnet release; address is the live mainnet
+# CLMM package (matches validation/cetus/cetus_rpc.py).
+CetusClmm = { git = "https://github.com/CetusProtocol/cetus-clmm-interface.git", subdir = "sui/cetus_clmm", rev = "mainnet-v1.52.3" }
+
+# Turbos interface — provides swap_router::swap_*_with_return_ that turbos_adapter
+# wraps. Pinned to a fixed commit; address is the live mainnet Turbos CLMM package.
+turbos_clmm = { git = "https://github.com/turbos-finance/turbos-sui-move-interface.git", subdir = "clmm", rev = "cff693265bfc41c7de2233afe31c9d7428adc9e1" }
 
 [addresses]
 arbitrage_system = "0x0"

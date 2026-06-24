@@ -29,6 +29,7 @@
 //! affect swap output. Output depends only on the static fee rate (`fee_pips`).
 
 use primitive_types::U256;
+use serde::{Deserialize, Serialize};
 
 /// √price in Q64.64.
 pub type SqrtPriceX64 = u128;
@@ -46,14 +47,14 @@ const MAX_SQRT_PRICE: u128 = 1u128 << 120;
 
 /// An initialized tick: its sqrt-price boundary and the net liquidity added when
 /// crossing it left→right (price increasing), exactly as UniV3 `liquidityNet`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TickBoundary {
     pub sqrt_price: SqrtPriceX64,
     pub liquidity_net: i128,
 }
 
 /// Everything needed to quote a swap on one CLMM pool.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClmmState {
     pub sqrt_price: SqrtPriceX64,
     pub liquidity: Liquidity,

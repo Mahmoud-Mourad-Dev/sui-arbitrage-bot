@@ -28,15 +28,25 @@ impl ReserveCache {
             .insert(pool.id.clone(), pool);
     }
 
-    /// Update just the reserves of an existing pool. Returns `false` if unknown.
+    /// Update just the reserves of an existing V2 pool. Returns `false` if the pool
+    /// is unknown or not a V2 pool (CLMM pools are refreshed via `upsert` of a freshly
+    /// decoded snapshot — see `ws.rs`).
     pub fn update_reserves(&self, id: &str, reserve_a: u64, reserve_b: u64) -> bool {
+        use crate::types::PoolKind;
         let mut guard = self.pools.write().expect("reserve cache poisoned");
         match guard.get_mut(id) {
-            Some(p) => {
-                p.reserve_a = reserve_a;
-                p.reserve_b = reserve_b;
-                true
-            }
+            Some(p) => match &mut p.kind {
+                PoolKind::V2 {
+                    reserve_a: ra,
+                    reserve_b: rb,
+                    ..
+                } => {
+                    *ra = reserve_a;
+                    *rb = reserve_b;
+                    true
+                }
+                PoolKind::Clmm(_) => false,
+            },
             None => false,
         }
     }
@@ -79,26 +89,26 @@ mod tests {
     use crate::types::Dex;
 
     fn pool(id: &str) -> PoolState {
-        PoolState {
-            id: id.to_string(),
-            dex: Dex::AmmV2,
-            token_a: "A".into(),
-            token_b: "B".into(),
-            reserve_a: 1_000,
-            reserve_b: 1_000,
-            fee_bps: 30,
-        }
+        PoolState::v2(id, Dex::AmmV2, "A", "B", 1_000, 1_000, 30)
     }
 
     #[test]
     fn upsert_get_update() {
+        use crate::types::PoolKind;
         let c = ReserveCache::new();
         assert!(c.is_empty());
         c.upsert(pool("0x1"));
         assert_eq!(c.len(), 1);
         assert!(c.update_reserves("0x1", 2_000, 500));
         let p = c.get("0x1").unwrap();
-        assert_eq!((p.reserve_a, p.reserve_b), (2_000, 500));
+        assert!(matches!(
+            p.kind,
+            PoolKind::V2 {
+                reserve_a: 2_000,
+                reserve_b: 500,
+                ..
+            }
+        ));
         assert!(!c.update_reserves("0xUNKNOWN", 1, 1));
     }
 }

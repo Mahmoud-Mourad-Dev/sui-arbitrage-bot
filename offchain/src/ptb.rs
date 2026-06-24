@@ -19,7 +19,7 @@
 //! — the loan funds the whole route and the change is the net profit.
 
 use crate::flashloan::{FlashLoanProvider, MoveCallSpec};
-use crate::scanner::{Hop, Opportunity};
+use crate::scanner::{Hop, Opportunity, Protocol};
 use crate::types::Dex;
 
 /// One step of the PTB, in execution order. Pure data — the live builder maps each
@@ -40,6 +40,12 @@ pub enum PtbStep {
         function: String,
         pool_id: String,
         min_out: u64,
+    },
+    /// `<protocol>::liquidate(...)` → (remain debt coin, seized collateral coin). The
+    /// seized collateral is then swapped back to the debt asset by the following hops.
+    Liquidate {
+        protocol: Protocol,
+        obligation_id: String,
     },
     /// `executor::settle_and_return(receipt, coin)` → proceeds (enforces profit)
     SettleAndReturn,
@@ -87,6 +93,48 @@ pub fn owned_arb_plan(opp: &Opportunity, min_profit: u64) -> Vec<PtbStep> {
     steps
 }
 
+/// Liquidation plan: `[flash borrow] → begin → liquidate → swap-back → settle_and_return
+/// → [flash repay] → transfer`. The seized collateral (from the liquidate leg) is
+/// swapped to the debt asset by `opp.route`; the profit gate and flash repay are the
+/// existing, unchanged gates. With `provider = None` the repay comes from owned capital
+/// and the plan ends at `settle` (no flash). Mirrors `flash_arb_plan` — liquidation is
+/// just another source on the same pipeline.
+#[must_use]
+pub fn liquidation_plan(
+    provider: Option<&dyn FlashLoanProvider>,
+    opp: &Opportunity,
+    min_profit: u64,
+) -> Vec<PtbStep> {
+    let leg = opp
+        .liquidation
+        .as_ref()
+        .expect("liquidation opportunity must carry a LiquidationLeg");
+    let mut steps = Vec::with_capacity(opp.route.len() + 5);
+    if let Some(p) = provider {
+        steps.push(PtbStep::FlashBorrow {
+            call: p.borrow_call(),
+            lender_id: p.lender_object_id().to_string(),
+            amount: leg.repay_amount,
+        });
+    }
+    steps.push(PtbStep::Begin { min_profit });
+    steps.push(PtbStep::Liquidate {
+        protocol: leg.protocol,
+        obligation_id: leg.obligation_id.clone(),
+    });
+    push_swaps(&mut steps, &opp.route); // seized collateral → debt asset
+    if let Some(p) = provider {
+        steps.push(PtbStep::SettleAndReturn);
+        steps.push(PtbStep::FlashRepay {
+            call: p.repay_call(),
+        });
+        steps.push(PtbStep::TransferToSender);
+    } else {
+        steps.push(PtbStep::Settle);
+    }
+    steps
+}
+
 fn push_swaps(steps: &mut Vec<PtbStep>, route: &[Hop]) {
     for hop in route {
         let (module, function) = adapter_call(hop);
@@ -118,11 +166,39 @@ fn adapter_call(hop: &Hop) -> (&'static str, &'static str) {
 mod tests {
     use super::*;
     use crate::flashloan::MockProvider;
-    use crate::scanner::Opportunity;
+    use crate::scanner::{LiquidationLeg, OppKind, Opportunity, Protocol};
     use crate::types::Dex;
+
+    fn liq_opp() -> Opportunity {
+        Opportunity {
+            kind: OppKind::Liquidation,
+            liquidation: Some(LiquidationLeg {
+                protocol: Protocol::Scallop,
+                obligation_id: "0xob".into(),
+                debt_type: "USDC".into(),
+                collateral_type: "SUI".into(),
+                repay_amount: 200_000_000,
+                extra_object_ids: vec![],
+            }),
+            route: vec![Hop {
+                pool_id: "0xPOOL".into(),
+                dex: Dex::Cetus,
+                token_in: "SUI".into(),
+                token_out: "USDC".into(),
+                a_to_b: true,
+            }],
+            input_amount: 200_000_000,
+            output_amount: 216_000_000,
+            gross_profit: 16_000_000,
+            flash_fee: 60_000,
+            net_profit: 15_000_000,
+        }
+    }
 
     fn opp() -> Opportunity {
         Opportunity {
+            kind: OppKind::Arb,
+            liquidation: None,
             route: vec![
                 Hop {
                     pool_id: "0xAB".into(),
@@ -222,25 +298,92 @@ mod tests {
             .iter()
             .any(|s| matches!(s, PtbStep::FlashBorrow { .. } | PtbStep::FlashRepay { .. })));
     }
+
+    #[test]
+    fn flash_liquidation_plan_shape() {
+        let p = MockProvider::new("0xpkg", "0xlender", 30);
+        let plan = liquidation_plan(Some(&p), &liq_opp(), 8_000);
+        // borrow → begin → liquidate → swap → settle_and_return → repay → transfer
+        assert!(matches!(
+            plan[0],
+            PtbStep::FlashBorrow {
+                amount: 200_000_000,
+                ..
+            }
+        ));
+        assert!(matches!(plan[1], PtbStep::Begin { .. }));
+        assert!(matches!(
+            plan[2],
+            PtbStep::Liquidate {
+                protocol: Protocol::Scallop,
+                ..
+            }
+        ));
+        assert!(matches!(plan[3], PtbStep::Swap { .. }));
+        assert!(matches!(plan[4], PtbStep::SettleAndReturn));
+        assert!(matches!(plan[5], PtbStep::FlashRepay { .. }));
+        assert!(matches!(plan[6], PtbStep::TransferToSender));
+        assert_eq!(plan.len(), 7);
+        // liquidate precedes the swap-back which precedes the profit gate
+        let liq = plan
+            .iter()
+            .position(|s| matches!(s, PtbStep::Liquidate { .. }))
+            .unwrap();
+        let swap = plan
+            .iter()
+            .position(|s| matches!(s, PtbStep::Swap { .. }))
+            .unwrap();
+        let settle = plan
+            .iter()
+            .position(|s| matches!(s, PtbStep::SettleAndReturn))
+            .unwrap();
+        assert!(liq < swap && swap < settle);
+    }
+
+    #[test]
+    fn owned_liquidation_plan_has_no_flash_and_ends_at_settle() {
+        let plan = liquidation_plan(None, &liq_opp(), 1);
+        assert!(matches!(plan.first(), Some(PtbStep::Begin { .. })));
+        assert!(matches!(plan[1], PtbStep::Liquidate { .. }));
+        assert!(matches!(plan.last(), Some(PtbStep::Settle)));
+        assert!(!plan
+            .iter()
+            .any(|s| matches!(s, PtbStep::FlashBorrow { .. } | PtbStep::FlashRepay { .. })));
+    }
 }
 
 // --- live assembly: plan -> sui_types ProgrammableTransaction ----------------
 #[cfg(feature = "live")]
 mod live {
     use super::PtbStep;
-    use anyhow::{bail, Result};
-    use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
+    use crate::types::Dex;
+    use anyhow::{bail, Context, Result};
+    use sui_types::base_types::{ObjectID, SuiAddress};
     use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
     use sui_types::transaction::{Argument, Command, ObjectArg, ProgrammableTransaction};
     use sui_types::{Identifier, TypeTag};
 
     /// Per-hop on-chain refs the builder needs (resolved from chain just before
-    /// building — object versions change every checkpoint).
+    /// building — object versions change every checkpoint, so never cache these).
+    ///
+    /// The adapter argument order differs per venue (this is the Phase-2 "PTB builder
+    /// changes"); `build` assembles each hop's args to match its adapter signature:
+    ///   - AmmV2:  `swap_*<A,B>(pool, coin, min_out, ctx)`
+    ///   - Cetus:  `swap_*<A,B>(config, pool, coin, min_out, clock, ctx)`
+    ///   - Turbos: `swap_*<A,B,FeeType>(pool, coin, min_out, clock, versioned, ctx)`
     pub struct ResolvedHop {
-        pub pool: ObjectArg, // SharedObject { id, initial_shared_version, mutable: true }
-        pub type_args: Vec<TypeTag>, // e.g. [In, Out] (+ fee tier for Turbos)
-        pub extra_objs: Vec<ObjectArg>, // venue extras (Clock 0x6, GlobalConfig, Versioned)
+        pub dex: Dex,
+        /// Mutable shared pool object.
+        pub pool: ObjectArg,
+        /// `[token_a, token_b]` for V2/Cetus; `[token_a, token_b, fee_type]` for Turbos.
+        pub type_args: Vec<TypeTag>,
         pub min_out: u64,
+        /// Cetus `GlobalConfig` (shared, immutable). Required for `Dex::Cetus`.
+        pub cetus_config: Option<ObjectArg>,
+        /// `Clock` at `0x6` (shared, immutable). Required for Cetus + Turbos.
+        pub clock: Option<ObjectArg>,
+        /// Turbos `Versioned` (shared, immutable). Required for `Dex::Turbos`.
+        pub turbos_versioned: Option<ObjectArg>,
     }
 
     /// Everything the live builder needs, resolved against the current chain state.
@@ -298,20 +441,31 @@ mod live {
             .zip(inputs.hops.iter())
         {
             let PtbStep::Swap {
-                module,
-                function,
-                min_out,
-                ..
+                module, function, ..
             } = step
             else {
                 bail!("plan/hop mismatch")
             };
             let pool_arg = ptb.obj(hop.pool)?;
-            let mut args = vec![pool_arg, coin];
-            for extra in &hop.extra_objs {
-                args.push(ptb.obj(*extra)?);
-            }
-            args.push(ptb.pure(*min_out)?);
+            let min_out_arg = ptb.pure(hop.min_out)?;
+            // Assemble args in the exact order each adapter expects (ctx is implicit).
+            let args = match hop.dex {
+                Dex::AmmV2 => vec![pool_arg, coin, min_out_arg],
+                Dex::Cetus => {
+                    let config =
+                        ptb.obj(hop.cetus_config.context("cetus hop missing GlobalConfig")?)?;
+                    let clock = ptb.obj(hop.clock.context("cetus hop missing Clock")?)?;
+                    vec![config, pool_arg, coin, min_out_arg, clock]
+                }
+                Dex::Turbos => {
+                    let clock = ptb.obj(hop.clock.context("turbos hop missing Clock")?)?;
+                    let versioned = ptb.obj(
+                        hop.turbos_versioned
+                            .context("turbos hop missing Versioned")?,
+                    )?;
+                    vec![pool_arg, coin, min_out_arg, clock, versioned]
+                }
+            };
             let swap = ptb.command(Command::move_call(
                 inputs.package,
                 id(module)?,
@@ -320,7 +474,6 @@ mod live {
                 args,
             ));
             coin = swap; // single-return (Coin<Out>)
-            let _ = min_out;
         }
 
         // 4. executor::settle_and_return<T>(receipt, coin) -> proceeds (PROFIT GATE)
@@ -355,7 +508,167 @@ mod live {
             other => other,
         }
     }
+
+    /// Everything the live liquidation builder needs, resolved fresh against chain.
+    /// Scallop-shaped (v1); other protocols add their own variant. The flash leg uses
+    /// Scallop's `borrow_flash_loan`/`repay_flash_loan` (version + market), and the
+    /// liquidate uses `protocol::liquidate::liquidate<Debt,Coll>`.
+    pub struct LiquidationInputs {
+        pub package: ObjectID,         // arbitrage_system (executor)
+        pub scallop_package: ObjectID, // Scallop `protocol` (flash_loan + liquidate)
+        pub debt_type: TypeTag,
+        pub collateral_type: TypeTag,
+        pub version: ObjectArg,
+        pub obligation: ObjectArg, // shared, mutable
+        pub market: ObjectArg,     // shared, mutable (flash + liquidate share it)
+        pub registry: ObjectArg,   // CoinDecimalsRegistry
+        pub x_oracle: ObjectArg,
+        pub clock: ObjectArg,
+        pub repay_amount: u64,
+        /// repay_amount + flash fee, split off `proceeds` to repay the loan exactly.
+        pub repay_total: u64,
+        pub min_profit: u64,
+        pub swap: ResolvedHop, // seized collateral → debt asset
+        pub sender: SuiAddress,
+    }
+
+    /// Assemble the Scallop liquidation PTB (flash-funded):
+    /// borrow_flash_loan → begin → liquidate → swap-back → settle_and_return →
+    /// repay_flash_loan → transfer remainder. All existing gates enforced; capital
+    /// at risk = gas only (a bad land reverts at `settle`/repay).
+    pub fn build_liquidation(
+        plan: &[PtbStep],
+        inputs: LiquidationInputs,
+    ) -> Result<ProgrammableTransaction> {
+        // Sanity: the plan must be a liquidation plan with a flash borrow + liquidate.
+        if !plan.iter().any(|s| matches!(s, PtbStep::Liquidate { .. })) {
+            bail!("build_liquidation called with a non-liquidation plan");
+        }
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let debt = vec![inputs.debt_type.clone()];
+
+        // 1. Scallop flash: borrow_flash_loan<Debt>(version, market, amount) -> (Coin, FlashLoan)
+        let version = ptb.obj(inputs.version)?;
+        let market = ptb.obj(inputs.market)?;
+        let amount = ptb.pure(inputs.repay_amount)?;
+        let borrow = ptb.command(Command::move_call(
+            inputs.scallop_package,
+            id("flash_loan")?,
+            id("borrow_flash_loan")?,
+            debt.clone(),
+            vec![version, market, amount],
+        ));
+        let repay_coin = nested(borrow, 0);
+        let loan = nested(borrow, 1);
+
+        // 2. executor::begin<Debt>(repay, min_profit) -> (coin, ArbReceipt)
+        let min_profit = ptb.pure(inputs.min_profit)?;
+        let begin = ptb.command(Command::move_call(
+            inputs.package,
+            id("executor")?,
+            id("begin")?,
+            debt.clone(),
+            vec![repay_coin, min_profit],
+        ));
+        let repay_coin = nested(begin, 0);
+        let arcpt = nested(begin, 1);
+
+        // 3. protocol::liquidate::liquidate<Debt,Coll>(version, obligation, market, repay,
+        //    registry, x_oracle, clock) -> (remain debt, seized collateral)
+        let version3 = ptb.obj(inputs.version)?;
+        let obligation = ptb.obj(inputs.obligation)?;
+        let market3 = ptb.obj(inputs.market)?;
+        let registry = ptb.obj(inputs.registry)?;
+        let x_oracle = ptb.obj(inputs.x_oracle)?;
+        let clock = ptb.obj(inputs.clock)?;
+        let liq = ptb.command(Command::move_call(
+            inputs.scallop_package,
+            id("liquidate")?,
+            id("liquidate")?,
+            vec![inputs.debt_type.clone(), inputs.collateral_type.clone()],
+            vec![
+                version3, obligation, market3, repay_coin, registry, x_oracle, clock,
+            ],
+        ));
+        let remain = nested(liq, 0);
+        let seized = nested(liq, 1);
+
+        // 4. swap seized collateral → debt asset (existing adapter convention)
+        let h = &inputs.swap;
+        let pool_arg = ptb.obj(h.pool)?;
+        let min_out = ptb.pure(h.min_out)?;
+        let swap_args = match h.dex {
+            Dex::AmmV2 => vec![pool_arg, seized, min_out],
+            Dex::Cetus => {
+                let cfg = ptb.obj(h.cetus_config.context("cetus hop missing GlobalConfig")?)?;
+                let clk = ptb.obj(h.clock.context("cetus hop missing Clock")?)?;
+                vec![cfg, pool_arg, seized, min_out, clk]
+            }
+            Dex::Turbos => {
+                let clk = ptb.obj(h.clock.context("turbos hop missing Clock")?)?;
+                let ver = ptb.obj(h.turbos_versioned.context("turbos hop missing Versioned")?)?;
+                vec![pool_arg, seized, min_out, clk, ver]
+            }
+        };
+        let (module, function) = (
+            super::adapter_module(h.dex),
+            if h.a_to_b {
+                "swap_exact_in_a_to_b"
+            } else {
+                "swap_exact_in_b_to_a"
+            },
+        );
+        let debt_from_swap = ptb.command(Command::move_call(
+            inputs.package,
+            id(module)?,
+            id(function)?,
+            h.type_args.clone(),
+            swap_args,
+        ));
+
+        // 5. merge the liquidate's leftover debt (`remain`, ≈0) into the swap output
+        ptb.command(Command::MergeCoins(debt_from_swap, vec![remain]));
+
+        // 6. executor::settle_and_return<Debt>(receipt, proceeds) (PROFIT GATE)
+        let proceeds = ptb.command(Command::move_call(
+            inputs.package,
+            id("executor")?,
+            id("settle_and_return")?,
+            debt.clone(),
+            vec![arcpt, debt_from_swap],
+        ));
+
+        // 7. repay flash: split exactly `repay_total` off proceeds, repay_flash_loan
+        //    (Scallop's repay consumes the coin + loan and returns nothing).
+        let owed_amt = ptb.pure(inputs.repay_total)?;
+        let owed = ptb.command(Command::SplitCoins(proceeds, vec![owed_amt]));
+        let version7 = ptb.obj(inputs.version)?;
+        let market7 = ptb.obj(inputs.market)?;
+        ptb.command(Command::move_call(
+            inputs.scallop_package,
+            id("flash_loan")?,
+            id("repay_flash_loan")?,
+            debt,
+            vec![version7, market7, nested(owed, 0), loan],
+        ));
+
+        // 8. transfer the remainder (net profit) to the sender
+        let recipient = ptb.pure(inputs.sender)?;
+        ptb.command(Command::TransferObjects(vec![proceeds], recipient));
+
+        Ok(ptb.finish())
+    }
+}
+
+/// Adapter module name for a venue (shared by the live builders).
+#[cfg(feature = "live")]
+fn adapter_module(dex: Dex) -> &'static str {
+    match dex {
+        Dex::AmmV2 => "amm_v2_adapter",
+        Dex::Cetus => "cetus_adapter",
+        Dex::Turbos => "turbos_adapter",
+    }
 }
 
 #[cfg(feature = "live")]
-pub use live::{build, BuildInputs, ResolvedHop};
+pub use live::{build, build_liquidation, BuildInputs, LiquidationInputs, ResolvedHop};

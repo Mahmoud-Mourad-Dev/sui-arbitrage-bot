@@ -27,11 +27,35 @@ pub fn quote_fee_bps(amount: u64, fee_bps: u64) -> u64 {
     n.div_ceil(u128::from(FEE_DENOM)) as u64
 }
 
+/// On-chain call shape of a provider's borrow/repay, so the live PTB builder can
+/// order arguments + thread the receipt correctly. Providers differ structurally:
+/// the in-package vault takes `(lender, amount)`; Scallop takes `(version, market,
+/// amount)` and repays `(version, market, coin, loan)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashStyle {
+    /// In-package `flash` vault. borrow(lender, amount) -> (Coin, FlashReceipt);
+    /// repay(lender, receipt, payment) -> Coin (change).
+    MockVault,
+    /// Scallop. borrow_flash_loan(version, market, amount) -> (Coin, FlashLoan);
+    /// repay_flash_loan(version, market, coin, loan). Needs the shared `Version` obj.
+    Scallop,
+}
+
 /// A pluggable flash-loan lender. Implementations: [`MockProvider`] (the in-package
-/// reference vault) and future Scallop / Navi / Suilend adapters.
+/// reference vault) and [`ScallopProvider`] (a live mainnet lender).
 pub trait FlashLoanProvider {
     fn name(&self) -> &str;
     fn fee_bps(&self) -> u64;
+
+    /// On-chain call shape (drives PTB argument ordering). Defaults to the vault.
+    fn style(&self) -> FlashStyle {
+        FlashStyle::MockVault
+    }
+    /// Extra shared-object ids the borrow/repay calls need beyond the lender object
+    /// (e.g. Scallop's `Version`). Resolved fresh to `ObjectArg`s by the live builder.
+    fn extra_object_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Fee owed to borrow `amount` (rounded up, matches `flash::fee_amount`).
     fn quote_fee(&self, amount: u64) -> u64 {
@@ -99,20 +123,86 @@ impl FlashLoanProvider for MockProvider {
     }
 }
 
-/// Construct a provider by name. Returns `None` for unknown names (flash disabled).
+/// Scallop flash-loan provider (live mainnet lender).
 ///
-/// To connect a real lender (Scallop / Navi / Suilend): implement
-/// `FlashLoanProvider` with that protocol's package id and its
-/// borrow/repay entry functions, then add a match arm here. See
-/// `docs/flash-loan-design.md` for each protocol's exact API.
+/// `protocol::flash_loan::borrow_flash_loan<T>(version, market, amount)
+///   -> (Coin<T>, FlashLoan<T>)` and
+/// `repay_flash_loan<T>(version, market, coin, loan)`.
+///
+/// `package_id` is Scallop's published-at id; `market_id`/`version_id` are the shared
+/// `Market` and `Version` objects (resolve fresh on-chain). `fee_bps` must match the
+/// market's configured flash-loan fee so off-chain sizing nets the true repayment.
+#[derive(Clone, Debug)]
+pub struct ScallopProvider {
+    pub package_id: String,
+    pub market_id: String,
+    pub version_id: String,
+    pub fee_bps: u64,
+}
+
+impl ScallopProvider {
+    pub fn new(
+        package_id: impl Into<String>,
+        market_id: impl Into<String>,
+        version_id: impl Into<String>,
+        fee_bps: u64,
+    ) -> Self {
+        Self {
+            package_id: package_id.into(),
+            market_id: market_id.into(),
+            version_id: version_id.into(),
+            fee_bps,
+        }
+    }
+}
+
+impl FlashLoanProvider for ScallopProvider {
+    fn name(&self) -> &str {
+        "scallop"
+    }
+    fn fee_bps(&self) -> u64 {
+        self.fee_bps
+    }
+    fn style(&self) -> FlashStyle {
+        FlashStyle::Scallop
+    }
+    fn extra_object_ids(&self) -> Vec<String> {
+        vec![self.version_id.clone()]
+    }
+    fn lender_object_id(&self) -> &str {
+        &self.market_id
+    }
+    fn borrow_call(&self) -> MoveCallSpec {
+        MoveCallSpec {
+            package: self.package_id.clone(),
+            module: "flash_loan".into(),
+            function: "borrow_flash_loan".into(),
+        }
+    }
+    fn repay_call(&self) -> MoveCallSpec {
+        MoveCallSpec {
+            package: self.package_id.clone(),
+            module: "flash_loan".into(),
+            function: "repay_flash_loan".into(),
+        }
+    }
+}
+
+/// Construct a provider by name. Returns `None` for unknown names (flash disabled).
+/// `extra` carries the provider's secondary object id when it needs one (Scallop's
+/// `Version`); ignored by the mock vault.
 pub fn provider_from(
     name: &str,
     package_id: &str,
     lender_id: &str,
     fee_bps: u64,
+    extra: &str,
 ) -> Option<Box<dyn FlashLoanProvider + Send + Sync>> {
     match name {
         "mock" => Some(Box::new(MockProvider::new(package_id, lender_id, fee_bps))),
+        "scallop" => Some(Box::new(ScallopProvider::new(
+            package_id, lender_id, extra, fee_bps,
+        ))),
         _ => None,
     }
 }
@@ -156,8 +246,36 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_mock_only() {
-        assert!(provider_from("mock", "0xp", "0xl", 30).is_some());
-        assert!(provider_from("scallop", "0xp", "0xl", 30).is_none());
+    fn registry_resolves_mock_and_scallop() {
+        assert!(provider_from("mock", "0xp", "0xl", 30, "").is_some());
+        assert!(provider_from("scallop", "0xpkg", "0xmarket", 30, "0xversion").is_some());
+        assert!(provider_from("navi", "0xp", "0xl", 30, "").is_none());
+    }
+
+    #[test]
+    fn mock_provider_style_is_vault() {
+        let p = MockProvider::new("0xpkg", "0xlender", 30);
+        assert_eq!(p.style(), FlashStyle::MockVault);
+        assert!(p.extra_object_ids().is_empty());
+    }
+
+    #[test]
+    fn scallop_provider_shape() {
+        let p = ScallopProvider::new("0xpkg", "0xmarket", "0xversion", 9);
+        assert_eq!(p.name(), "scallop");
+        assert_eq!(p.style(), FlashStyle::Scallop);
+        assert_eq!(p.lender_object_id(), "0xmarket"); // borrow/repay take the Market
+        assert_eq!(p.extra_object_ids(), vec!["0xversion".to_string()]); // + Version
+        assert_eq!(
+            p.borrow_call(),
+            MoveCallSpec {
+                package: "0xpkg".into(),
+                module: "flash_loan".into(),
+                function: "borrow_flash_loan".into()
+            }
+        );
+        assert_eq!(p.repay_call().function, "repay_flash_loan");
+        // fee parity with the ceil formula
+        assert_eq!(p.quote_fee(1_000_000), quote_fee_bps(1_000_000, 9));
     }
 }

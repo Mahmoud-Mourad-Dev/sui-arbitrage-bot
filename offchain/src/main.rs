@@ -45,15 +45,7 @@ fn run_demo(config: &Config, cache: &ReserveCache) {
         ("0xCA", "C", "A", 1_000_000_000, 2_000_000_000), // C ~ 2 A
     ];
     for (id, a, b, ra, rb) in seed {
-        cache.upsert(PoolState {
-            id: id.into(),
-            dex: Dex::AmmV2,
-            token_a: a.into(),
-            token_b: b.into(),
-            reserve_a: ra,
-            reserve_b: rb,
-            fee_bps: 30,
-        });
+        cache.upsert(PoolState::v2(id, Dex::AmmV2, a, b, ra, rb, 30));
     }
 
     let params = ScanParams {

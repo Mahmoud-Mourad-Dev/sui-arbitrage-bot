@@ -8,14 +8,33 @@ tuned for micro-spreads and minimal gas.
   hot-potato profit gate. No AMM is hardcoded; venues plug in behind an adapter
   convention. Atomicity comes from running the whole route in one Programmable
   Transaction Block (PTB).
-- **Off-chain (`offchain/`, Rust):** subscribes to pool updates, maintains a local
-  reserve cache, simulates `x*y=k` swaps, detects profitable cycles, builds &
-  dry-runs PTBs, and submits **only** profitable transactions.
+- **Off-chain (`offchain/`, Rust):** maintains a local pool cache, prices each hop
+  with its native model (V2 `x*y=k` **or** CLMM tick-crossing engine), detects
+  profitable cycles, re-prices the best candidate **authoritatively** on-chain, then
+  dry-runs and (optionally) submits.
 
-> Status: Move package + reference AMM + executor are complete and tested (8 Move
-> tests). Rust quant core (math, cache, scanner) is complete and tested (7 tests,
-> clippy/fmt clean). The live Sui-SDK integration (`ws`/`ptb`/`executor`) is a
-> faithful, feature-gated seam — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> ### Status (honest)
+> - **On-chain:** executor + reference AMM + flash module complete; **real Cetus +
+>   Turbos adapters** built against pinned **mainnet** interface packages. `sui move
+>   test` **12/12**.
+> - **Off-chain core:** CLMM-aware scanner (`PoolKind{V2,Clmm}`), authoritative-quote
+>   seam, Scallop flash provider, frictions + risk models. `cargo test` **51/51**,
+>   clippy `-D warnings` + fmt clean.
+> - **Opportunity sources (one pipeline, no fork):** arbitrage, **liquidation**
+>   (Scallop: index + oracle + health + sizing + liquidation PTB), and backrun-arb —
+>   all emit the same `Opportunity` through the same dry-run → `RiskGuard` → submit
+>   gate. See [docs/strategies-plan.md](docs/strategies-plan.md).
+> - **Live path (`ws`/`quoter`/`executor`/`ptb::live`/`liquidation::{index,oracle}`):**
+>   written against the real Sui SDK + venue/lender packages, **feature-gated
+>   (`--features live`)**; compiles with the SDK but is *not* built/run in offline CI
+>   here, and submit is **off by default** (`ARB_SUBMIT_ENABLED=false`).
+> - **Execution verdict: NO-GO / measure-first.** Arb ≈ $17/day paper does not survive
+>   frictions ([frictions-adjusted-pnl.md](docs/frictions-adjusted-pnl.md)). Liquidations
+>   have a better (fat-tailed) payoff shape but need a live paper run to measure
+>   frequency × capture before any submit
+>   ([liquidation-pnl.md](docs/liquidation-pnl.md)). Capital is never at risk (dry-run +
+>   on-chain `settle`/`repay` gates). Architecture:
+>   [docs/consolidation-plan.md](docs/consolidation-plan.md).
 
 ## Layout
 
@@ -43,13 +62,13 @@ sui-arbitrage-bot/
 ## Quick start
 
 ```bash
-# On-chain
+# On-chain (fetches pinned mainnet Cetus + Turbos interfaces on first build)
 sui move build
-sui move test                       # 8 passing
+sui move test                       # 12 passing
 
-# Off-chain quant core (offline, no SDK)
+# Off-chain core (offline, no SDK)
 cd offchain
-cargo test                          # 7 passing
+cargo test                          # 36 passing
 cargo run                           # demo scan: finds the seeded triangular arb
 ```
 
@@ -73,6 +92,10 @@ folded into `min_profit`; it is never modeled on-chain.
 
 ## Docs
 
+- [Consolidation plan](docs/consolidation-plan.md) — the one canonical architecture (funnel: engine → authoritative quote → dry-run), data model, ingestion, venue scope
+- [Strategies plan](docs/strategies-plan.md) — opportunity sources (arb / liquidation / backrun) on one pipeline; verified Scallop/Suilend liquidate APIs; indexing + oracle + health approach
+- [Liquidation P&L](docs/liquidation-pnl.md) — liquidation methodology + race model + conditional go/no-go (measure-first)
+- [Frictions-adjusted P&L](docs/frictions-adjusted-pnl.md) — latency + competition model on the paper baseline; the go/no-go (**NO-GO** for now)
 - [Architecture](docs/ARCHITECTURE.md) — layers, PTB, adapters, flash-loan seam
 - [Gas optimization checklist](docs/GAS_OPTIMIZATION.md)
 - [Security review checklist](docs/SECURITY.md)
