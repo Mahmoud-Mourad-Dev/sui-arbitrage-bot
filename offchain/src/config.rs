@@ -63,6 +63,15 @@ pub struct Config {
     /// Version == `flash_version_id`); these add the oracle + decimals registry.
     pub scallop_x_oracle_id: String,
     pub scallop_registry_id: String,
+    /// Scallop `protocol` package id (flash_loan + liquidate move calls).
+    pub scallop_package_id: String,
+    /// Signing: path to the Sui file keystore + the sender address to use.
+    /// The key never leaves the keystore and is never logged.
+    pub keystore_path: String,
+    pub sender_address: String,
+    /// Venue shared-object ids the adapters need (versions resolved fresh on-chain).
+    pub cetus_global_config_id: String,
+    pub turbos_versioned_id: String,
 }
 
 impl Config {
@@ -93,6 +102,14 @@ impl Config {
             liq_enabled: env_parse("ARB_LIQ_ENABLED", false)?,
             scallop_x_oracle_id: env_or("ARB_SCALLOP_X_ORACLE_ID", "0x0"),
             scallop_registry_id: env_or("ARB_SCALLOP_REGISTRY_ID", "0x0"),
+            scallop_package_id: env_or(
+                "ARB_SCALLOP_PACKAGE_ID",
+                "0xefe8b36d5b2e43728cc323298626b83177803521d195cfb11e15b910e892fddf",
+            ),
+            keystore_path: env_or("ARB_KEYSTORE_PATH", ""),
+            sender_address: env_or("ARB_SENDER_ADDRESS", "0x0"),
+            cetus_global_config_id: env_or("ARB_CETUS_GLOBAL_CONFIG_ID", "0x0"),
+            turbos_versioned_id: env_or("ARB_TURBOS_VERSIONED_ID", "0x0"),
         })
     }
 }

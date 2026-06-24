@@ -1,36 +1,43 @@
 //! Dry-run + submission (feature = "live").
 //!
-//! Submit-only-if-profitable, with the dry-run→land race defused:
-//!   1. Resolve fresh object refs; **authoritatively re-quote** the route (stage 2)
-//!      within a freshness budget. If the edge has closed, skip — no gas.
-//!   2. Derive per-hop `min_out` floors from the authoritative per-hop outputs
-//!      (× (1 − slippage)). A route that has moved fails fast/cheap on-chain instead
-//!      of landing a bad fill.
-//!   3. Build the PTB with those floors, `dry_run_transaction_block`, and require
-//!      `effects.status == Success` AND net (balance changes − gas) ≥ `min_profit`.
-//!   4. Consult the [`RiskGuard`] (kill switch / daily-loss / blacklist), then submit
-//!      **only if `submit_enabled`** — sign from the keystore and execute. On-chain
-//!      `settle`/`repay` are the final backstops: a bad land reverts for gas only.
-//!   5. Record realized vs predicted for the health metric + structured decision log.
+//! Real submit-only-if-profitable path:
+//!   1. Resolve fresh refs; authoritatively re-quote the route (`quoter`). If the edge
+//!      closed, skip — no gas.
+//!   2. Derive per-hop `min_out` floors from the authoritative outputs.
+//!   3. **Build the real PTB** (`ptb::build` / `build_liquidation`) with those floors,
+//!      wrap in `TransactionData`, and **`dry_run_transaction_block`** it. Require
+//!      `effects.status == Success` AND dry-run net (base-coin balance change, which
+//!      nets gas for a SUI base) ≥ `min_profit`. Gas comes from the dry-run, not a flat
+//!      constant.
+//!   4. Consult the [`RiskGuard`]. Then **only if `submit_enabled`**: load the signing
+//!      key from a file keystore (never logged), sign, `execute_transaction_block`
+//!      (WaitForLocalExecution), parse landed effects, and `record_realized`.
+//!   5. With `submit_enabled = false` (default) the path still builds + dry-runs, then
+//!      stops before signing — so the dry-run is always exercised.
 //!
-//! VERIFICATION STATUS: written against the live Sui SDK; compiles under
-//! `--features live`. Not built/run in the offline CI here, and a real mainnet submit
-//! additionally needs a funded keystore — gated off by default (`submit_enabled`).
-//!
-//! ALL opportunity kinds converge here. Arb/backrun re-quote their swap route
-//! (`quoter::authoritative_route_quotes`) and build via `ptb::build`; liquidation
-//! (`OppKind::Liquidation`) re-prices via the protocol's own sizing read and builds via
-//! `ptb::build_liquidation`. The parts that decide *whether to submit* — `min_out`
-//! floors, the dry-run net check, the `RiskGuard`, and `submit_enabled` — are shared
-//! and kind-agnostic, so liquidation rides the same gate with no parallel submit logic.
+//! VERIFICATION STATUS: compiles under `--features live` against sui-sdk
+//! `mainnet-v1.73.2`. A real submit additionally needs a published package + a funded
+//! keystore + live pools (testnet, Phase 5); not exercised in offline CI here.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::Config;
 use crate::quoter::{self, LivePoolRef};
 use crate::risk::{Decision, RiskGuard};
-use crate::scanner::Opportunity;
+use crate::scanner::{OppKind, Opportunity};
 use crate::ws::LiveRegistry;
+
+use sui_json_rpc_types::{
+    SuiObjectDataOptions, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions,
+};
+use sui_sdk::SuiClient;
+use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress};
+use sui_types::object::Owner;
+use sui_types::transaction::{
+    ObjectArg, ProgrammableTransaction, SharedObjectMutability, Transaction, TransactionData,
+};
+use sui_types::transaction_driver_types::ExecuteTransactionRequestType;
+use sui_types::TypeTag;
 
 /// Outcome of evaluating one opportunity (for logging/metrics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +61,7 @@ pub async fn try_execute(
 
     let client = SuiClientBuilder::default().build(&config.rpc_url).await?;
 
-    // Resolve each hop's on-chain ref + direction from the registry (fresh snapshots).
+    // 1. Resolve hop refs + authoritative re-quote (stage 2). Engine ranking over-detects.
     let refs: Vec<(LivePoolRef, bool)> = {
         let reg = registry.read().expect("registry poisoned");
         opp.route
@@ -67,90 +74,318 @@ pub async fn try_execute(
             })
             .collect::<Result<_>>()?
     };
-
-    // 1. Authoritative re-price (stage 2). Engine ranking over-detects; this is truth.
     let hop_outs = quoter::authoritative_route_quotes(&client, &refs, opp.input_amount).await?;
     let final_out = *hop_outs.last().ok_or_else(|| anyhow!("empty route"))?;
-
-    // Net of the flat gas estimate + flash fee already folded into the scanner's
-    // min_profit; here we re-check against the authoritative output.
     if final_out <= opp.input_amount {
-        tracing::info!(
-            pool_hops = refs.len(),
-            "skip: authoritative re-quote shows no edge"
-        );
-        guard.record_skip();
-        return Ok(Outcome::Skipped);
-    }
-    let gross = final_out - opp.input_amount;
-    let net_mist = gross.saturating_sub(config.gas_cost_estimate);
-    if net_mist < config.min_profit {
-        tracing::info!(
-            net_mist,
-            min = config.min_profit,
-            "skip: below min_profit after authoritative re-quote"
-        );
+        tracing::info!("skip: authoritative re-quote shows no edge");
         guard.record_skip();
         return Ok(Outcome::Skipped);
     }
 
-    // 2. Per-hop min_out floors from the authoritative outputs.
+    // 2. Per-hop min_out floors from the authoritative outputs (never 0).
     let floors: Vec<u64> = hop_outs
         .iter()
         .map(|out| apply_slippage_floor(*out, config.per_hop_slippage_bps))
         .collect();
 
-    // 3. Build the PTB (flash or owned) with floors and dry-run it.
-    let net_usd = mist_to_usd(net_mist, base_decimals, price_usd);
-    let pool_ids: Vec<&str> = opp.route.iter().map(|h| h.pool_id.as_str()).collect();
+    // 3. Build the REAL PTB (this is what was previously orphaned), then dry-run it.
+    let sender: SuiAddress = config
+        .sender_address
+        .parse()
+        .context("ARB_SENDER_ADDRESS")?;
+    let base_type: TypeTag = config.base_token.parse().context("base token type")?;
+    let pt = build_ptb(&client, config, opp, &refs, &floors, sender).await?;
 
-    // 4. Risk gate (kill switch / daily loss / blacklist / profitability).
-    let decision = guard.should_submit(net_usd, &pool_ids);
-    match decision {
+    let gas_price = client.read_api().get_reference_gas_price().await?;
+    let gas_coin = pick_gas_coin(&client, sender).await?;
+    let tx_data =
+        TransactionData::new_programmable(sender, vec![gas_coin], pt, config.gas_budget, gas_price);
+
+    let dry = dry_run(&client, &tx_data, &base_type, sender).await?;
+    if !dry.success {
+        tracing::warn!(?dry, "skip: dry-run reverted");
+        guard.record_skip();
+        return Ok(Outcome::Skipped);
+    }
+    // Real gas from the dry-run; net is the base-coin balance change (nets gas for SUI base).
+    if dry.net_base < i128::from(config.min_profit) {
+        tracing::info!(
+            net = dry.net_base,
+            gas = dry.gas_used,
+            "skip: below min_profit after dry-run"
+        );
+        guard.record_skip();
+        return Ok(Outcome::Skipped);
+    }
+
+    // 4. Risk gate.
+    let net_usd = mist_to_usd(dry.net_base.max(0) as u64, base_decimals, price_usd);
+    let pool_ids: Vec<&str> = opp.route.iter().map(|h| h.pool_id.as_str()).collect();
+    match guard.should_submit(net_usd, &pool_ids) {
         Decision::Skip(reason) => {
             tracing::warn!(reason, net_usd, "skip: risk guard");
             guard.record_skip();
             Ok(Outcome::Skipped)
         }
         Decision::Submit => {
-            // The PTB is assembled by `ptb::build` from the plan + resolved refs +
-            // `floors`; the dry-run + sign/submit use the SDK. Gated behind
-            // `submit_enabled` so a fully-wired node still defaults to dry-run-only.
-            let _ = &floors;
             if !config.submit_enabled {
                 tracing::info!(
+                    net_base = dry.net_base,
+                    gas = dry.gas_used,
                     net_usd,
-                    hops = refs.len(),
-                    "DRY-RUN ONLY: candidate clears all gates; submit_enabled=false"
+                    "DRY-RUN ONLY: clears all gates; submit_enabled=false — stopping before signing"
                 );
                 return Ok(Outcome::DryRunOnly);
             }
-            submit(&client, config, opp, &refs, &floors, guard, net_usd).await
+            submit(
+                &client,
+                config,
+                tx_data,
+                &base_type,
+                sender,
+                guard,
+                net_usd,
+                base_decimals,
+                price_usd,
+            )
+            .await
         }
     }
 }
 
-/// Sign + submit the floored PTB, then record realized vs predicted. Only reached
-/// when `submit_enabled` is true and the risk guard approved.
-async fn submit(
-    _client: &sui_sdk::SuiClient,
+/// Build the PTB for this opportunity: liquidation → `build_liquidation`, otherwise the
+/// flash-arb `build`. Resolves all shared-object refs fresh from chain.
+async fn build_ptb(
+    client: &SuiClient,
     config: &Config,
-    _opp: &Opportunity,
-    _refs: &[(LivePoolRef, bool)],
-    _floors: &[u64],
+    opp: &Opportunity,
+    refs: &[(LivePoolRef, bool)],
+    floors: &[u64],
+    sender: SuiAddress,
+) -> Result<ProgrammableTransaction> {
+    let base_type: TypeTag = config.base_token.parse()?;
+    let pkg: ObjectID = config.package_id.parse().context("ARB_PACKAGE_ID")?;
+
+    if opp.kind == OppKind::Liquidation {
+        bail!("liquidation PTB assembly wired in Phase 3 (Pyth update) — not built here");
+    }
+
+    // Flash-arb path (ptb::live::build): borrow → begin → swaps → settle_and_return → repay.
+    let provider = crate::flashloan::provider_from(
+        &config.flash_provider,
+        &config.scallop_package_id,
+        &config.flash_lender_id,
+        config.flash_fee_bps,
+        &config.flash_version_id,
+    )
+    .ok_or_else(|| anyhow!("unknown flash provider '{}'", config.flash_provider))?;
+    let plan = crate::ptb::flash_arb_plan(provider.as_ref(), opp, config.min_profit);
+
+    let clock = clock_arg();
+    let cetus_cfg = resolve_shared(client, &config.cetus_global_config_id, false)
+        .await
+        .ok();
+    let turbos_ver = resolve_shared(client, &config.turbos_versioned_id, false)
+        .await
+        .ok();
+
+    let mut hops = Vec::with_capacity(refs.len());
+    for (i, (lref, a_to_b)) in refs.iter().enumerate() {
+        let pool = ObjectArg::SharedObject {
+            id: lref.pool_id,
+            initial_shared_version: lref.init_shared_version,
+            mutability: SharedObjectMutability::Mutable,
+        };
+        let mut type_args = vec![lref.type_a.clone(), lref.type_b.clone()];
+        if let Some(ft) = &lref.fee_type {
+            type_args.push(ft.clone());
+        }
+        hops.push(crate::ptb::ResolvedHop {
+            dex: lref.dex,
+            a_to_b: *a_to_b,
+            pool,
+            type_args,
+            min_out: floors[i],
+            cetus_config: cetus_cfg,
+            clock: Some(clock),
+            turbos_versioned: turbos_ver,
+        });
+    }
+
+    let lender = resolve_shared(client, &config.flash_lender_id, true).await?;
+    let inputs = crate::ptb::BuildInputs {
+        package: pkg,
+        provider_package: config.scallop_package_id.parse()?,
+        base_type,
+        lender,
+        amount: opp.input_amount,
+        min_profit: config.min_profit,
+        hops,
+        sender,
+    };
+    crate::ptb::build(&plan, inputs)
+}
+
+/// Resolve a shared object's `ObjectArg` (fetches its initial shared version fresh).
+async fn resolve_shared(client: &SuiClient, id_str: &str, mutable: bool) -> Result<ObjectArg> {
+    let id: ObjectID = id_str
+        .parse()
+        .with_context(|| format!("object id {id_str}"))?;
+    let resp = client
+        .read_api()
+        .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
+        .await?;
+    let data = resp
+        .data
+        .ok_or_else(|| anyhow!("object {id_str} not found"))?;
+    let initial_shared_version = match data.owner {
+        Some(Owner::Shared {
+            initial_shared_version,
+        }) => initial_shared_version,
+        other => bail!("object {id_str} is not shared: {other:?}"),
+    };
+    Ok(ObjectArg::SharedObject {
+        id,
+        initial_shared_version,
+        mutability: if mutable {
+            SharedObjectMutability::Mutable
+        } else {
+            SharedObjectMutability::Immutable
+        },
+    })
+}
+
+/// The system `Clock` at 0x6 (shared, immutable, initial version 1).
+fn clock_arg() -> ObjectArg {
+    ObjectArg::SharedObject {
+        id: ObjectID::from_hex_literal("0x6").expect("clock id"),
+        initial_shared_version: SequenceNumber::from_u64(1),
+        mutability: SharedObjectMutability::Immutable,
+    }
+}
+
+/// Pick the largest owned SUI coin as the gas payment.
+async fn pick_gas_coin(client: &SuiClient, sender: SuiAddress) -> Result<ObjectRef> {
+    let coins = client
+        .coin_read_api()
+        .get_coins(sender, None, None, Some(50))
+        .await?;
+    let coin = coins
+        .data
+        .into_iter()
+        .max_by_key(|c| c.balance)
+        .ok_or_else(|| anyhow!("no SUI coins to pay gas for {sender}"))?;
+    Ok(coin.object_ref())
+}
+
+#[derive(Debug)]
+struct DryRun {
+    success: bool,
+    net_base: i128,
+    gas_used: u64,
+}
+
+/// Dry-run the assembled transaction; extract success, the sender's net base-coin
+/// balance change, and the gas used (real, not the flat constant).
+async fn dry_run(
+    client: &SuiClient,
+    tx_data: &TransactionData,
+    base_type: &TypeTag,
+    sender: SuiAddress,
+) -> Result<DryRun> {
+    let resp = client
+        .read_api()
+        .dry_run_transaction_block(tx_data.clone())
+        .await?;
+    let success = resp.effects.status().is_ok();
+    let g = resp.effects.gas_cost_summary();
+    let gas_used = g.computation_cost + g.storage_cost
+        - g.storage_rebate.min(g.storage_cost + g.computation_cost);
+    let net_base = net_base_change(&resp.balance_changes, base_type, sender);
+    Ok(DryRun {
+        success,
+        net_base,
+        gas_used,
+    })
+}
+
+/// Sum the sender's balance change in the base coin (i128; negative = spent).
+fn net_base_change(
+    changes: &[sui_json_rpc_types::BalanceChange],
+    base_type: &TypeTag,
+    sender: SuiAddress,
+) -> i128 {
+    changes
+        .iter()
+        .filter(|c| &c.coin_type == base_type && owner_is(&c.owner, sender))
+        .map(|c| c.amount)
+        .sum()
+}
+
+fn owner_is(owner: &Owner, addr: SuiAddress) -> bool {
+    matches!(owner, Owner::AddressOwner(a) if *a == addr)
+}
+
+/// Sign with the file keystore and submit; parse landed effects → `record_realized`.
+/// Only reached when `submit_enabled` is true and the risk guard approved.
+#[allow(clippy::too_many_arguments)]
+async fn submit(
+    client: &SuiClient,
+    config: &Config,
+    tx_data: TransactionData,
+    base_type: &TypeTag,
+    sender: SuiAddress,
     guard: &mut RiskGuard,
-    net_usd: f64,
+    predicted_usd: f64,
+    base_decimals: u32,
+    price_usd: f64,
 ) -> Result<Outcome> {
-    // Build TransactionData(ptb, sender, gas, gas_price, gas_budget), load the keystore
-    // key for `sender` (NEVER logged), sign, and
-    // `quorum_driver_api().execute_transaction_block(.., WaitForLocalExecution)`.
-    // Parse the returned effects' balance changes − gas_used → realized net; convert to
-    // USD and `guard.record_realized(realized_usd)`.
-    let _ = config;
-    guard.record_submit(net_usd);
+    use shared_crypto::intent::Intent;
+    use std::path::PathBuf;
+    use sui_keys::keystore::{AccountKeystore, FileBasedKeystore};
+
+    if config.keystore_path.is_empty() {
+        bail!("submit_enabled but ARB_KEYSTORE_PATH is unset");
+    }
+    let keystore = FileBasedKeystore::load_or_create(&PathBuf::from(&config.keystore_path))?;
+    // The signing key never leaves the keystore and is never logged.
+    let sig = keystore
+        .sign_secure(&sender, &tx_data, Intent::sui_transaction())
+        .await?;
+    let tx = Transaction::from_data(tx_data, vec![sig]);
+
+    let opts = SuiTransactionBlockResponseOptions::new()
+        .with_effects()
+        .with_balance_changes();
+    let resp = client
+        .quorum_driver_api()
+        .execute_transaction_block(
+            tx,
+            opts,
+            Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+        )
+        .await?;
+
+    guard.record_submit(predicted_usd);
+    // Realized = sender's base-coin balance change from the LANDED effects (negative if
+    // the trade reverted / lost the race and only cost gas).
+    let realized_base = resp
+        .balance_changes
+        .as_deref()
+        .map(|c| net_base_change(c, base_type, sender))
+        .unwrap_or(0);
+    let realized_usd = mist_to_usd(realized_base.max(0) as u64, base_decimals, price_usd)
+        - if realized_base < 0 {
+            mist_to_usd((-realized_base) as u64, base_decimals, price_usd)
+        } else {
+            0.0
+        };
+    guard.record_realized(realized_usd);
     tracing::info!(
-        net_usd,
-        "submitted (records realized from effects on completion)"
+        digest = ?resp.digest,
+        realized_base,
+        realized_usd,
+        "submitted; realized recorded"
     );
     Ok(Outcome::Submitted)
 }
@@ -181,7 +416,6 @@ mod tests {
 
     #[test]
     fn mist_to_usd_scales_by_decimals() {
-        // 1 SUI (9 decimals) at $1.50
         assert!((mist_to_usd(1_000_000_000, 9, 1.50) - 1.50).abs() < 1e-9);
     }
 }

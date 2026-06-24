@@ -316,6 +316,7 @@ dependencies = [
  "serde_json",
  "shared-crypto",
  "sui-json-rpc-types",
+ "sui-keys",
  "sui-sdk",
  "sui-types",
  "thiserror 1.0.69",

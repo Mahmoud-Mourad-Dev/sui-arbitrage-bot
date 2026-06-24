@@ -22,6 +22,7 @@ live = [
     "dep:sui-sdk",
     "dep:sui-json-rpc-types",
     "dep:sui-types",
+    "dep:sui-keys",
     "dep:shared-crypto",
     "dep:tokio-tungstenite",
     "dep:futures-util",
@@ -42,6 +43,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 sui-sdk = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
+sui-keys = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 shared-crypto = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }
