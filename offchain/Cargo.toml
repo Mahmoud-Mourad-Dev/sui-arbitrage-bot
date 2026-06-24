@@ -39,9 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 
 # --- live-only (Sui SDK). Optional + git-pinned; not built by default. ---
-sui-sdk = { git = "https://github.com/MystenLabs/sui", rev = "ff1fe0ec455153707136cffd0dc77dfb77ba9ad5", optional = true }
-sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", rev = "ff1fe0ec455153707136cffd0dc77dfb77ba9ad5", optional = true }
-sui-types = { git = "https://github.com/MystenLabs/sui", rev = "ff1fe0ec455153707136cffd0dc77dfb77ba9ad5", optional = true }
-shared-crypto = { git = "https://github.com/MystenLabs/sui", rev = "ff1fe0ec455153707136cffd0dc77dfb77ba9ad5", optional = true }
+sui-sdk = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
+sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
+sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
+shared-crypto = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
 futures-util = { version = "0.3", optional = true }
