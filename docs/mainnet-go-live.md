@@ -58,10 +58,12 @@ ARB_KILL_SWITCH=false
 ARB_MAX_DAILY_LOSS_USD=5
 ARB_LIQ_ENABLED=false            # liquidations not mainnet-ready yet
 ```
-> **Verify** `ARB_CETUS_GLOBAL_CONFIG_ID` / `ARB_TURBOS_VERSIONED_ID` against current
-> Cetus/Turbos docs before spending gas (these are the well-known mainnet `GlobalConfig`
-> / `Versioned`, but confirm). Clock `0x6` and every object's version are resolved
-> automatically. Pool ids: `cd validation/cetus && python3 mv_scan.py discover`.
+> **Both venue ids above were verified against mainnet** (read-only `sui_getObject`):
+> `0xdaa462…a3d8f` → `0x1eabed72…::config::GlobalConfig` (shared), and
+> `0xf1cf0e81…45b6f` → `0x91bfbc38…::pool::Versioned` (shared) — matching the exact
+> Cetus/Turbos packages the adapters call. Clock `0x6` and every object's version are
+> resolved automatically (you supply only ids). Pool ids:
+> `cd validation/cetus && python3 mv_scan.py discover`.
 
 ## Step 4 — Dry-run-paper (submit OFF — zero capital risk)
 ```bash
