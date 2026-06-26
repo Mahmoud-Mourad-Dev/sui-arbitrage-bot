@@ -120,8 +120,12 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
 
     // 3. Scan + (gated) submit loop.
     let mut tick = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
+    let mut ticks: u64 = 0;
+    // Heartbeat every ~30s so the operator can see it's alive between (rare) candidates.
+    let heartbeat = (30_000 / config.poll_interval_ms.max(1)).max(1);
     loop {
         tick.tick().await;
+        ticks += 1;
         let pools = cache.snapshot();
         let params = ScanParams {
             base_token: config.base_token.clone(),
@@ -131,7 +135,24 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
             flash_fee_bps: config.flash_fee_bps,
             min_profit: config.min_profit,
         };
-        if let Some(opp) = scanner::find_best(&pools, &params) {
+        let found = scanner::find_best(&pools, &params);
+        if ticks.is_multiple_of(heartbeat) {
+            info!(
+                ticks,
+                pools = pools.len(),
+                candidate = found.is_some(),
+                "alive (scanning; logs a candidate only when one clears min_profit)"
+            );
+        }
+        if let Some(opp) = found {
+            info!(
+                kind = ?opp.kind,
+                input = opp.input_amount,
+                est_out = opp.output_amount,
+                est_net = opp.net_profit,
+                hops = opp.route.len(),
+                "candidate — re-quoting + dry-running"
+            );
             if let Err(e) = executor::try_execute(
                 &config,
                 &opp,
