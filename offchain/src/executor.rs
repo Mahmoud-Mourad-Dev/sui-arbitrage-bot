@@ -167,11 +167,7 @@ async fn build_ptb(
     let pkg: ObjectID = config.package_id.parse().context("ARB_PACKAGE_ID")?;
 
     if opp.kind == OppKind::Liquidation {
-        // `ptb::build_liquidation` (with the in-PTB Pyth/x_oracle refresh) exists and is
-        // plan-tested; resolving its full oracle object set (pyth_state, pyth_registry,
-        // per-feed PriceInfoObjects, x_oracle/rule packages) + the runtime submit is the
-        // Phase-5 testnet step.
-        bail!("liquidation submit assembly is the Phase-5 step; build_liquidation is wired + plan-tested");
+        return build_liquidation_ptb(client, config, opp, refs, floors, sender).await;
     }
 
     // Flash-arb path (ptb::live::build): borrow → begin → swaps → settle_and_return → repay.
@@ -228,6 +224,111 @@ async fn build_ptb(
         sender,
     };
     crate::ptb::build(&plan, inputs)
+}
+
+/// Assemble + build the Scallop liquidation PTB (flash → in-PTB oracle refresh →
+/// liquidate → swap-back → settle_and_return → repay). Object ids come from config;
+/// every shared object's initial version is resolved fresh on-chain. Still gated by
+/// `submit_enabled` upstream; the accumulator→`HotPotatoVector` Pyth update is the
+/// remaining on-chain item (see docs/testnet-runbook.md).
+async fn build_liquidation_ptb(
+    client: &SuiClient,
+    config: &Config,
+    opp: &Opportunity,
+    refs: &[(LivePoolRef, bool)],
+    floors: &[u64],
+    sender: SuiAddress,
+) -> Result<ProgrammableTransaction> {
+    let leg = opp
+        .liquidation
+        .as_ref()
+        .ok_or_else(|| anyhow!("liquidation opp missing leg"))?;
+    let debt_type: TypeTag = leg.debt_type.parse().context("debt type")?;
+    let collateral_type: TypeTag = leg.collateral_type.parse().context("collateral type")?;
+
+    let provider = crate::flashloan::provider_from(
+        &config.flash_provider,
+        &config.scallop_package_id,
+        &config.flash_lender_id,
+        config.flash_fee_bps,
+        &config.flash_version_id,
+    )
+    .ok_or_else(|| anyhow!("unknown flash provider '{}'", config.flash_provider))?;
+    let plan = crate::ptb::liquidation_plan(Some(provider.as_ref()), opp, config.min_profit);
+    let repay_total = provider.repay_total(leg.repay_amount);
+
+    // swap-back hop: seized collateral → debt asset (first route hop).
+    let (lref, a_to_b) = refs
+        .first()
+        .ok_or_else(|| anyhow!("liquidation route has no swap hop"))?;
+    let clock = clock_arg();
+    let cetus_cfg = resolve_shared(client, &config.cetus_global_config_id, false)
+        .await
+        .ok();
+    let turbos_ver = resolve_shared(client, &config.turbos_versioned_id, false)
+        .await
+        .ok();
+    let mut type_args = vec![lref.type_a.clone(), lref.type_b.clone()];
+    if let Some(ft) = &lref.fee_type {
+        type_args.push(ft.clone());
+    }
+    let swap = crate::ptb::ResolvedHop {
+        dex: lref.dex,
+        a_to_b: *a_to_b,
+        pool: ObjectArg::SharedObject {
+            id: lref.pool_id,
+            initial_shared_version: lref.init_shared_version,
+            mutability: SharedObjectMutability::Mutable,
+        },
+        type_args,
+        min_out: *floors.first().unwrap_or(&0),
+        cetus_config: cetus_cfg,
+        clock: Some(clock),
+        turbos_versioned: turbos_ver,
+    };
+
+    let debt_pi = config
+        .price_info_object(&leg.debt_type)
+        .ok_or_else(|| anyhow!("no PriceInfoObject configured for debt {}", leg.debt_type))?;
+    let coll_pi = config
+        .price_info_object(&leg.collateral_type)
+        .ok_or_else(|| {
+            anyhow!(
+                "no PriceInfoObject configured for collateral {}",
+                leg.collateral_type
+            )
+        })?;
+
+    let inputs = crate::ptb::LiquidationInputs {
+        package: config.package_id.parse().context("ARB_PACKAGE_ID")?,
+        scallop_package: config.scallop_package_id.parse()?,
+        debt_type,
+        collateral_type,
+        version: resolve_shared(client, &config.flash_version_id, false).await?,
+        obligation: resolve_shared(client, &leg.obligation_id, true).await?,
+        market: resolve_shared(client, &config.flash_lender_id, true).await?,
+        registry: resolve_shared(client, &config.scallop_registry_id, false).await?,
+        x_oracle: resolve_shared(client, &config.scallop_x_oracle_id, true).await?,
+        clock,
+        x_oracle_package: config
+            .x_oracle_package_id
+            .parse()
+            .context("ARB_X_ORACLE_PACKAGE_ID")?,
+        pyth_rule_package: config
+            .pyth_rule_package_id
+            .parse()
+            .context("ARB_PYTH_RULE_PACKAGE_ID")?,
+        pyth_state: resolve_shared(client, &config.pyth_state_id, false).await?,
+        pyth_registry: resolve_shared(client, &config.scallop_pyth_registry_id, false).await?,
+        debt_price_info: resolve_shared(client, debt_pi, false).await?,
+        collateral_price_info: resolve_shared(client, coll_pi, false).await?,
+        repay_amount: leg.repay_amount,
+        repay_total,
+        min_profit: config.min_profit,
+        swap,
+        sender,
+    };
+    crate::ptb::build_liquidation(&plan, inputs)
 }
 
 /// Resolve a shared object's `ObjectArg` (fetches its initial shared version fresh).

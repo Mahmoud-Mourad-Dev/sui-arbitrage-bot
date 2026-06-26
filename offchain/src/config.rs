@@ -72,6 +72,14 @@ pub struct Config {
     /// Venue shared-object ids the adapters need (versions resolved fresh on-chain).
     pub cetus_global_config_id: String,
     pub turbos_versioned_id: String,
+    /// Liquidation in-PTB oracle refresh (Scallop x_oracle pyth_rule). Object ids;
+    /// versions resolved fresh on-chain. See docs/testnet-runbook.md.
+    pub x_oracle_package_id: String,
+    pub pyth_rule_package_id: String,
+    pub pyth_state_id: String,
+    pub scallop_pyth_registry_id: String,
+    /// Per-coin Pyth `PriceInfoObject` ids, as `"<coin_type>=<object_id>"` entries.
+    pub pyth_price_info_objects: Vec<String>,
 }
 
 impl Config {
@@ -110,6 +118,24 @@ impl Config {
             sender_address: env_or("ARB_SENDER_ADDRESS", "0x0"),
             cetus_global_config_id: env_or("ARB_CETUS_GLOBAL_CONFIG_ID", "0x0"),
             turbos_versioned_id: env_or("ARB_TURBOS_VERSIONED_ID", "0x0"),
+            x_oracle_package_id: env_or("ARB_X_ORACLE_PACKAGE_ID", "0x0"),
+            pyth_rule_package_id: env_or(
+                "ARB_PYTH_RULE_PACKAGE_ID",
+                "0x1cf913c825c202cbbb71c378edccb9c04723fa07a73b88677b2ef89c6e203a85",
+            ),
+            pyth_state_id: env_or("ARB_PYTH_STATE_ID", "0x0"),
+            scallop_pyth_registry_id: env_or("ARB_SCALLOP_PYTH_REGISTRY_ID", "0x0"),
+            pyth_price_info_objects: env_list("ARB_PYTH_PRICE_INFO_OBJECTS"),
+        })
+    }
+
+    /// The Pyth `PriceInfoObject` id configured for `coin_type`, from
+    /// `pyth_price_info_objects` (`"<coin_type>=<object_id>"`). `None` if unset.
+    #[must_use]
+    pub fn price_info_object(&self, coin_type: &str) -> Option<&str> {
+        self.pyth_price_info_objects.iter().find_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            (k.trim() == coin_type).then_some(v.trim())
         })
     }
 }
