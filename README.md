@@ -100,7 +100,8 @@ folded into `min_profit`; it is never modeled on-chain.
 - [Gas optimization checklist](docs/GAS_OPTIMIZATION.md)
 - [Security review checklist](docs/SECURITY.md)
 - [Testing strategy](docs/TESTING.md)
-- [Testnet validation report](docs/testnet-validation-report.md) — sim == exec proof
+- [Live validation runbook](docs/testnet-runbook.md) — operator-executed Phase 5/6 procedure: publish → configure → mainnet dry-run-paper (recommended) or testnet real adapter swap. Needs a funded key; submit off by default
+- [Testnet validation report](docs/testnet-validation-report.md) — sim == exec for the **in-package reference AMM only** (profit gate + V2 math + PTB round-trip). Does **not** validate the Cetus/Turbos adapters or the live path — see [testnet-runbook.md](docs/testnet-runbook.md)
 - [External venue readiness audit](docs/external-venue-readiness-audit.md) — Cetus/Turbos/Kriya CLMM pricing, why `x*y=k` fails, the CLMM engine
 - [Cetus parity validation](docs/cetus-parity-validation.md) — engine vs Cetus on-chain quoter: 1,034/1,034 exact across 27 mainnet pools
 - [DeepBook + Aftermath study](docs/deepbook-aftermath-study.md) — next-gen market graph: native CLOB (parity PASS) + aggregator oracle, read-only

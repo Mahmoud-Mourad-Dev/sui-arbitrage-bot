@@ -1,10 +1,24 @@
 # Testnet Validation Report
 
-**System:** `arbitrage_system` (Sui Move) + `arb-scanner` (Rust)
+> ## ⚠️ SCOPE — what this validated (read first)
+> This run validated **only the in-package reference AMM** (`arbitrage_system::amm_v2`
+> + the `validation_coins` test tokens) end-to-end: off-chain `x*y=k` sim == on-chain
+> execution through `executor::begin/settle`. It is strong evidence for **the profit
+> gate + the V2 math + the PTB round-trip**, and nothing more.
+>
+> It does **NOT** validate the mainnet-facing live path: the real **Cetus / Turbos**
+> swap adapters, the CLMM authoritative quoter, live ingestion, dry-run → submit, the
+> **liquidation** flow, or any **flash-loan** (Scallop) interaction. Those are **not yet
+> validated on-chain** — that work is tracked in **[testnet-runbook.md](testnet-runbook.md)**
+> and is pending a published package + a funded testnet key. Do **not** cite the numbers
+> below as evidence the live/adapter code works.
+
+**System:** `arbitrage_system` (Sui Move) + `arb-scanner` (Rust) — **reference AMM only**
 **Network:** Sui Testnet · **Date:** 2026-06-21
 **Toolchain:** `sui 1.73.1`, `rustc/cargo 1.96.0`
-**Result:** ✅ PASS — off-chain simulation matched on-chain execution to the unit
-(**error = 0.000%**, goal < 1%); all four failure modes behaved as designed.
+**Result:** ✅ PASS *(reference-AMM scope)* — off-chain sim matched on-chain execution
+to the unit (**error = 0.000%**, goal < 1%); all four failure modes behaved as designed.
+**This says nothing about the Cetus/Turbos adapters or the live path.**
 
 ---
 
