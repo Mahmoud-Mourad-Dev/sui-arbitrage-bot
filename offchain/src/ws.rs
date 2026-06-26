@@ -1,22 +1,19 @@
 //! Live pool ingestion (feature = "live").
 //!
-//! CLMM pools do **not** emit simple reserve deltas, so (per the accepted
-//! consolidation plan, Decision 2) ingestion is **event-triggered object re-read**:
 //!   * `bootstrap_pools` — `multi_get_object_with_options` over the tracked pools,
 //!     decode each into a CLMM `PoolState` (for the scanner) + a `LivePoolRef` (for
-//!     the quoter/PTB), keyed by object version.
-//!   * `run` — subscribe to each venue's swap / liquidity events; on an event for a
-//!     tracked pool, re-read that pool object and upsert the fresh snapshot.
+//!     the quoter/PTB).
+//!   * `run` — **polls** the tracked pools on an interval and upserts fresh snapshots.
+//!     (Sui is deprecating `suix_subscribeEvent` and most RPCs don't serve WS
+//!     subscriptions, so we poll rather than subscribe.)
 //!
 //! Stage-1 scanning uses the pool's current `sqrt_price`/`liquidity` as a single
 //! active range (cheap, approximate); the authoritative `quoter` (stage 2) reads full
-//! on-chain state incl. ticks before anything is acted on, so ingestion does not need
-//! the whole tick array on the hot path.
+//! on-chain state incl. ticks before anything is acted on.
 //!
-//! VERIFICATION STATUS: written against the live Sui SDK; compiles under
-//! `--features live`. Not built/run in the offline CI here. Field names match the
-//! Cetus/Turbos pool structs used by the parity-proven Python readers
-//! (`validation/cetus/cetus_rpc.py`, `turbos_rpc.py`).
+//! Pool field names are venue-specific and **verified on mainnet**:
+//!   Cetus `pool::Pool` → `current_sqrt_price`/`liquidity`/`fee_rate`;
+//!   Turbos `pool::Pool` → `sqrt_price`/`liquidity`/`fee`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -107,95 +104,67 @@ pub async fn bootstrap_pools(
     Ok(())
 }
 
-/// Subscribe to venue swap/liquidity events and refresh affected pools by re-reading
-/// their objects (CLMMs have no reserve-delta events).
+/// Keep the cache + registry fresh by **polling** the tracked pool objects on an
+/// interval. Sui is deprecating `suix_subscribeEvent`, and most RPCs (incl. private
+/// providers like QuickNode) don't serve WS subscriptions, so we poll instead of
+/// subscribe — re-reading every tracked pool each tick via `multi_get_object`.
 pub async fn run(
     config: &Config,
     cache: &Arc<ReserveCache>,
     registry: &LiveRegistry,
 ) -> Result<()> {
-    use futures_util::StreamExt;
-    use sui_json_rpc_types::{EventFilter, SuiObjectDataOptions};
+    use sui_json_rpc_types::SuiObjectDataOptions;
     use sui_sdk::SuiClientBuilder;
     use sui_types::base_types::ObjectID;
 
-    let client = SuiClientBuilder::default()
-        .ws_url(&config.ws_url)
-        .build(&config.rpc_url)
-        .await?;
-
-    // Track the set of pool ids we care about.
-    let tracked: std::collections::HashSet<String> = parse_tracked(&config.tracked_pools)?
-        .into_iter()
-        .map(|t| t.pool_id)
-        .collect();
-
-    // Subscribe to swap events on each venue's CLMM module.
-    let filters = vec![
-        EventFilter::MoveModule {
-            package: super::quoter::CETUS_PKG.parse()?,
-            module: "pool".parse()?,
-        },
-        EventFilter::MoveModule {
-            package: super::quoter::TURBOS_PKG.parse()?,
-            module: "pool".parse()?,
-        },
-    ];
-    let mut stream = client
-        .event_api()
-        .subscribe_event(EventFilter::Any(filters))
-        .await?;
+    let client = SuiClientBuilder::default().build(&config.rpc_url).await?;
+    let tracked = parse_tracked(&config.tracked_pools)?;
+    let ids: Vec<ObjectID> = tracked
+        .iter()
+        .map(|t| t.pool_id.parse())
+        .collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        return Ok(());
+    }
     let opts = SuiObjectDataOptions::new()
         .with_content()
         .with_type()
         .with_owner();
-    tracing::info!("ws: subscribed to Cetus + Turbos pool events");
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+        config.poll_interval_ms.max(100),
+    ));
+    tracing::info!(
+        pools = ids.len(),
+        every_ms = config.poll_interval_ms,
+        "pool refresh: polling"
+    );
 
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        let Some(pool_id) = pool_id_from_event(&event) else {
-            continue;
-        };
-        if !tracked.contains(&pool_id) {
-            continue;
-        }
-        // The venue is known from the registry (we only got here because it's tracked).
-        let dex = match registry.read().expect("registry poisoned").get(&pool_id) {
-            Some(r) => r.dex,
-            None => continue,
-        };
-        let Ok(id) = pool_id.parse::<ObjectID>() else {
-            continue;
-        };
-        // Event-triggered re-read: pull the fresh pool object and upsert.
-        match client
+    loop {
+        tick.tick().await;
+        let objs = match client
             .read_api()
-            .get_object_with_options(id, opts.clone())
+            .multi_get_object_with_options(ids.clone(), opts.clone())
             .await
         {
-            Ok(resp) => match decode_pool(dex, &resp) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("pool refresh rpc failed: {e}");
+                continue;
+            }
+        };
+        for (t, obj) in tracked.iter().zip(objs) {
+            match decode_pool(t.dex, &obj) {
                 Ok((state, lref)) => {
                     cache.upsert(state);
                     registry
                         .write()
                         .expect("registry poisoned")
-                        .insert(pool_id.clone(), lref);
+                        .insert(t.pool_id.clone(), lref);
                 }
-                Err(e) => tracing::debug!(pool = %pool_id, "decode failed: {e}"),
-            },
-            Err(e) => tracing::debug!(pool = %pool_id, "re-read failed: {e}"),
+                Err(e) => tracing::debug!(pool = %t.pool_id, "refresh decode failed: {e}"),
+            }
         }
     }
-    Ok(())
-}
-
-/// Extract the pool object id from a venue swap/liquidity event's parsed JSON.
-fn pool_id_from_event(event: &sui_json_rpc_types::SuiEvent) -> Option<String> {
-    event
-        .parsed_json
-        .get("pool")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
 }
 
 /// Decode a venue pool object into `(PoolState, LivePoolRef)`.
@@ -219,9 +188,16 @@ fn decode_pool(
     };
     let fields = mv.fields.clone().to_json_value(); // to_json_value consumes self
 
-    let sqrt_price: u128 = json_u128(&fields, "current_sqrt_price")?;
+    // Pool field names differ per venue (verified on mainnet):
+    //   Cetus  pool::Pool → current_sqrt_price, liquidity, fee_rate
+    //   Turbos pool::Pool → sqrt_price,          liquidity, fee
+    let (sqrt_key, fee_key) = match dex {
+        Dex::Turbos => ("sqrt_price", "fee"),
+        Dex::Cetus | Dex::AmmV2 => ("current_sqrt_price", "fee_rate"),
+    };
+    let sqrt_price: u128 = json_u128(&fields, sqrt_key)?;
     let liquidity: u128 = json_u128(&fields, "liquidity")?;
-    let fee_rate: u64 = json_u64(&fields, "fee_rate").unwrap_or(0);
+    let fee_rate: u64 = json_u64(&fields, fee_key).unwrap_or(0);
 
     let init_shared_version = match data.owner.as_ref() {
         Some(sui_types::object::Owner::Shared {
