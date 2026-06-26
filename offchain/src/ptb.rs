@@ -377,6 +377,7 @@ mod tests {
 #[cfg(feature = "live")]
 mod live {
     use super::PtbStep;
+    use crate::flashloan::scallop_pins;
     use crate::types::Dex;
     use anyhow::{bail, Context, Result};
     use sui_types::base_types::{ObjectID, SuiAddress};
@@ -628,8 +629,8 @@ mod live {
         let amount = ptb.pure(inputs.repay_amount)?;
         let borrow = ptb.command(Command::move_call(
             inputs.scallop_package,
-            id("flash_loan")?,
-            id("borrow_flash_loan")?,
+            id(scallop_pins::FLASH_MODULE)?,
+            id(scallop_pins::BORROW_FN)?,
             debt.clone(),
             vec![version, market, amount],
         ));
@@ -658,8 +659,8 @@ mod live {
         let clock = ptb.obj(inputs.clock)?;
         let liq = ptb.command(Command::move_call(
             inputs.scallop_package,
-            id("liquidate")?,
-            id("liquidate")?,
+            id(scallop_pins::LIQUIDATE_MODULE)?,
+            id(scallop_pins::LIQUIDATE_FN)?,
             vec![inputs.debt_type.clone(), inputs.collateral_type.clone()],
             vec![
                 version3, obligation, market3, repay_coin, registry, x_oracle, clock,
@@ -721,8 +722,8 @@ mod live {
         let market7 = ptb.obj(inputs.market)?;
         ptb.command(Command::move_call(
             inputs.scallop_package,
-            id("flash_loan")?,
-            id("repay_flash_loan")?,
+            id(scallop_pins::FLASH_MODULE)?,
+            id(scallop_pins::REPAY_FN)?,
             debt,
             vec![version7, market7, nested(owed, 0), loan],
         ));

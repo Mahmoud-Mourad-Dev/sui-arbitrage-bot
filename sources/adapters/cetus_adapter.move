@@ -21,6 +21,11 @@ use cetusclmm::tick_math;
 
 /// Output fell below `min_out`.
 const E_SLIPPAGE: u64 = 1;
+/// Exact-in invariant: with `by_amount_in = true`, Cetus's `swap_pay_amount` must equal
+/// `amount_in`, so the input balance is fully consumed by the repay split. We assert
+/// this explicitly (rather than rely on `destroy_zero`'s generic abort) so any drift in
+/// Cetus's exact-in semantics fails loudly with a named code.
+const E_INEXACT_REPAY: u64 = 2;
 
 /// Swap exact `coin_in` of A for B (a2b: price decreasing). Aborts if out < `min_out`.
 public fun swap_exact_in_a_to_b<A, B>(
@@ -51,7 +56,8 @@ public fun swap_exact_in_a_to_b<A, B>(
     let mut in_bal = coin::into_balance(coin_in);
     let pay_bal = balance::split(&mut in_bal, pay);
     pool::repay_flash_swap<A, B>(config, pool, pay_bal, balance::zero<B>(), receipt);
-    balance::destroy_zero(in_bal); // exact-in: pay == amount_in, so no dust remains
+    assert!(balance::value(&in_bal) == 0, E_INEXACT_REPAY); // pay == amount_in (exact-in)
+    balance::destroy_zero(in_bal);
 
     let out = coin::from_balance(recv_b, ctx);
     assert!(coin::value(&out) >= min_out, E_SLIPPAGE);
@@ -83,6 +89,7 @@ public fun swap_exact_in_b_to_a<A, B>(
     let mut in_bal = coin::into_balance(coin_in);
     let pay_bal = balance::split(&mut in_bal, pay);
     pool::repay_flash_swap<A, B>(config, pool, balance::zero<A>(), pay_bal, receipt);
+    assert!(balance::value(&in_bal) == 0, E_INEXACT_REPAY); // pay == amount_in (exact-in)
     balance::destroy_zero(in_bal);
 
     let out = coin::from_balance(recv_a, ctx);

@@ -27,6 +27,26 @@ pub fn quote_fee_bps(amount: u64, fee_bps: u64) -> u64 {
     n.div_ceil(u128::from(FEE_DENOM)) as u64
 }
 
+/// Scallop call coordinates, **verified against the `scallop-io/sui-lending-protocol`
+/// `protocol` package source** (module `protocol`, commit on the pinned clone). These
+/// are the single source of truth for the move-calls the flash provider + liquidation
+/// PTB emit; the `scallop_pins` tests fail loudly if our emitted coordinates drift.
+///
+///   flash_loan::borrow_flash_loan<T>(version, market, amount, ctx) -> (Coin<T>, FlashLoan<T>)
+///   flash_loan::repay_flash_loan<T>(version, market, coin, loan, ctx)
+///   liquidate::liquidate<Debt,Coll>(version, obligation, market, available_repay,
+///       coin_decimals_registry, x_oracle, clock, ctx) -> (Coin<Debt> remain, Coin<Coll> seized)
+pub mod scallop_pins {
+    /// `protocol` package address (named-address `protocol`; matches the mainnet pkg).
+    pub const PACKAGE_ADDR: &str =
+        "0xefe8b36d5b2e43728cc323298626b83177803521d195cfb11e15b910e892fddf";
+    pub const FLASH_MODULE: &str = "flash_loan";
+    pub const BORROW_FN: &str = "borrow_flash_loan";
+    pub const REPAY_FN: &str = "repay_flash_loan";
+    pub const LIQUIDATE_MODULE: &str = "liquidate";
+    pub const LIQUIDATE_FN: &str = "liquidate";
+}
+
 /// On-chain call shape of a provider's borrow/repay, so the live PTB builder can
 /// order arguments + thread the receipt correctly. Providers differ structurally:
 /// the in-package vault takes `(lender, amount)`; Scallop takes `(version, market,
@@ -175,15 +195,15 @@ impl FlashLoanProvider for ScallopProvider {
     fn borrow_call(&self) -> MoveCallSpec {
         MoveCallSpec {
             package: self.package_id.clone(),
-            module: "flash_loan".into(),
-            function: "borrow_flash_loan".into(),
+            module: scallop_pins::FLASH_MODULE.into(),
+            function: scallop_pins::BORROW_FN.into(),
         }
     }
     fn repay_call(&self) -> MoveCallSpec {
         MoveCallSpec {
             package: self.package_id.clone(),
-            module: "flash_loan".into(),
-            function: "repay_flash_loan".into(),
+            module: scallop_pins::FLASH_MODULE.into(),
+            function: scallop_pins::REPAY_FN.into(),
         }
     }
 }
@@ -277,5 +297,23 @@ mod tests {
         assert_eq!(p.repay_call().function, "repay_flash_loan");
         // fee parity with the ceil formula
         assert_eq!(p.quote_fee(1_000_000), quote_fee_bps(1_000_000, 9));
+    }
+
+    /// Pin the verified Scallop coordinates. If anyone edits `scallop_pins` (or the
+    /// provider stops using it), this fails loudly — guarding against silent drift from
+    /// the values verified against Scallop source.
+    #[test]
+    fn scallop_signatures_pinned() {
+        assert_eq!(scallop_pins::FLASH_MODULE, "flash_loan");
+        assert_eq!(scallop_pins::BORROW_FN, "borrow_flash_loan");
+        assert_eq!(scallop_pins::REPAY_FN, "repay_flash_loan");
+        assert_eq!(scallop_pins::LIQUIDATE_MODULE, "liquidate");
+        assert_eq!(scallop_pins::LIQUIDATE_FN, "liquidate");
+        assert!(scallop_pins::PACKAGE_ADDR.starts_with("0xefe8b36d"));
+        // the provider must emit exactly the pinned coordinates
+        let p = ScallopProvider::new(scallop_pins::PACKAGE_ADDR, "0xmarket", "0xversion", 9);
+        assert_eq!(p.borrow_call().module, scallop_pins::FLASH_MODULE);
+        assert_eq!(p.borrow_call().function, scallop_pins::BORROW_FN);
+        assert_eq!(p.repay_call().function, scallop_pins::REPAY_FN);
     }
 }

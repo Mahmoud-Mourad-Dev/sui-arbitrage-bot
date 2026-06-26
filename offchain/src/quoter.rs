@@ -161,14 +161,15 @@ async fn turbos_quote(
         vec![pool_arg, a2b_arg, by_in_arg, amt_arg, clock_arg],
     ));
     let bytes = dev_inspect_first_return(client, ptb.finish()).await?;
-    // ComputeSwapState: amount_a, amount_b, ... — the output side depends on a2b.
-    // Offsets confirmed against turbos_rpc.py; out = amount_b for a2b else amount_a.
-    let (off_out, _off_in) = if a2b {
-        (8usize, 0usize)
-    } else {
-        (0usize, 8usize)
-    };
-    decode_u64_at(&bytes, off_out)
+    // ComputeSwapState BCS layout (each field is a u128 = 16 bytes), matching the
+    // parity-proven `turbos_rpc.py`:
+    //   amount_a[0:16] amount_b[16:32] amount_specified_remaining[32:48] amount_calculated[48:64]
+    // The exact-in OUTPUT is `amount_calculated` (independent of direction), so we read
+    // the u128 at offset 48 and narrow. (`a2b` only selects the input/output coin types,
+    // already encoded in the call args.)
+    let _ = a2b;
+    decode_u128_at(&bytes, 48)
+        .and_then(|v| u64::try_from(v).map_err(|_| anyhow!("turbos amount_calculated exceeds u64")))
 }
 
 /// Run a read-only `ProgrammableTransaction` and return the first command's first
@@ -210,4 +211,48 @@ fn decode_u64_at(bytes: &[u8], off: usize) -> Result<u64> {
         .get(off..off + 8)
         .ok_or_else(|| anyhow!("return value too short for u64 at {off}"))?;
     Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+/// Decode a little-endian u128 at byte offset `off`.
+fn decode_u128_at(bytes: &[u8], off: usize) -> Result<u128> {
+    let slice = bytes
+        .get(off..off + 16)
+        .ok_or_else(|| anyhow!("return value too short for u128 at {off}"))?;
+    Ok(u128::from_le_bytes(slice.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cetus `CalculatedSwapResult` BCS layout (matches the parity-proven
+    /// `validation/cetus/cetus_rpc.py::decode_swap_result`):
+    ///   amount_in u64 [0,8) · amount_out u64 [8,16) · fee_amount u64 [16,24) · ...
+    /// Locks the Cetus output offset (8) — fails loudly if the decode drifts.
+    #[test]
+    fn cetus_amount_out_offset_matches_python() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1_000_000u64.to_le_bytes()); // amount_in
+        b.extend_from_slice(&987_654u64.to_le_bytes()); // amount_out  <-- the one we read
+        b.extend_from_slice(&321u64.to_le_bytes()); // fee_amount
+        b.extend_from_slice(&30u64.to_le_bytes()); // fee_rate
+        assert_eq!(decode_u64_at(&b, 8).unwrap(), 987_654);
+    }
+
+    /// Turbos `ComputeSwapState` BCS layout (matches `turbos_rpc.py`, which returns
+    /// `b[48:64]`): four u128 fields —
+    ///   amount_a[0,16) · amount_b[16,32) · amount_specified_remaining[32,48) ·
+    ///   amount_calculated[48,64)   <-- the exact-in OUTPUT.
+    /// Locks the Turbos output offset (48, u128) — the prior u64@8 decode was wrong.
+    #[test]
+    fn turbos_amount_calculated_offset_matches_python() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&111u128.to_le_bytes()); // amount_a
+        b.extend_from_slice(&222u128.to_le_bytes()); // amount_b
+        b.extend_from_slice(&333u128.to_le_bytes()); // amount_specified_remaining
+        b.extend_from_slice(&987_654u128.to_le_bytes()); // amount_calculated <-- output
+        assert_eq!(decode_u128_at(&b, 48).unwrap(), 987_654);
+        // and NOT the (previously, wrongly) decoded u64@8 = low 8 bytes of amount_b
+        assert_ne!(decode_u64_at(&b, 8).unwrap(), 987_654);
+    }
 }
