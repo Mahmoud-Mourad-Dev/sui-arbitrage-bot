@@ -377,7 +377,7 @@ mod tests {
 #[cfg(feature = "live")]
 mod live {
     use super::PtbStep;
-    use crate::flashloan::scallop_pins;
+    use crate::flashloan::{scallop_pins, FlashStyle};
     use crate::types::Dex;
     use anyhow::{bail, Context, Result};
     use sui_types::base_types::{ObjectID, SuiAddress};
@@ -413,13 +413,20 @@ mod live {
     /// Everything the live builder needs, resolved against the current chain state.
     pub struct BuildInputs {
         pub package: ObjectID,          // arbitrage_system package id
-        pub provider_package: ObjectID, // lender's package (== package for the mock)
+        pub provider_package: ObjectID, // lender's package (mock = our package; scallop = protocol)
         pub base_type: TypeTag,         // borrowed/base coin type
-        pub lender: ObjectArg,          // shared lender vault (mutable)
+        pub lender: ObjectArg,          // mock: FlashLender vault; scallop: Market (both mutable)
         pub amount: u64,                // loan size
         pub min_profit: u64,
         pub hops: Vec<ResolvedHop>,
         pub sender: SuiAddress,
+        /// Flash provider shape — selects the borrow/repay call convention.
+        pub flash_style: crate::flashloan::FlashStyle,
+        /// Scallop `Version` object (required for `FlashStyle::Scallop`; `None` for mock).
+        pub version: Option<ObjectArg>,
+        /// amount + flash fee; for Scallop we split exactly this off `proceeds` to repay
+        /// (its `repay_flash_loan` consumes the coin and returns nothing).
+        pub repay_total: u64,
     }
 
     fn id(s: &str) -> Result<Identifier> {
@@ -433,18 +440,39 @@ mod live {
         let mut ptb = ProgrammableTransactionBuilder::new();
         let base = vec![inputs.base_type.clone()];
 
-        // 1. flash::borrow<T>(lender, amount) -> (loan, FlashReceipt)
-        let lender_arg = ptb.obj(inputs.lender)?;
+        // 1. flash borrow → (loan coin, receipt). Shape depends on the provider.
         let amount_arg = ptb.pure(inputs.amount)?;
-        let borrow = ptb.command(Command::move_call(
-            inputs.provider_package,
-            id("flash")?,
-            id("borrow")?,
-            base.clone(),
-            vec![lender_arg, amount_arg],
-        ));
-        let loan = nested(borrow, 0);
-        let frcpt = nested(borrow, 1);
+        let (loan, frcpt) = match inputs.flash_style {
+            FlashStyle::MockVault => {
+                // arbitrage_system::flash::borrow<T>(lender, amount) -> (Coin<T>, FlashReceipt)
+                let lender_arg = ptb.obj(inputs.lender)?;
+                let b = ptb.command(Command::move_call(
+                    inputs.provider_package,
+                    id("flash")?,
+                    id("borrow")?,
+                    base.clone(),
+                    vec![lender_arg, amount_arg],
+                ));
+                (nested(b, 0), nested(b, 1))
+            }
+            FlashStyle::Scallop => {
+                // flash_loan::borrow_flash_loan<T>(version, market, amount) -> (Coin<T>, FlashLoan<T>)
+                let version = ptb.obj(
+                    inputs
+                        .version
+                        .context("scallop flash needs Version object")?,
+                )?;
+                let market = ptb.obj(inputs.lender)?;
+                let b = ptb.command(Command::move_call(
+                    inputs.provider_package,
+                    id(scallop_pins::FLASH_MODULE)?,
+                    id(scallop_pins::BORROW_FN)?,
+                    base.clone(),
+                    vec![version, market, amount_arg],
+                ));
+                (nested(b, 0), nested(b, 1))
+            }
+        };
 
         // 2. executor::begin<T>(loan, min_profit) -> (coin, ArbReceipt)
         let min_profit_arg = ptb.pure(inputs.min_profit)?;
@@ -509,19 +537,42 @@ mod live {
             vec![arcpt, coin],
         ));
 
-        // 5. flash::repay<T>(lender, receipt, proceeds) -> change (REPAYMENT GATE)
-        let lender_arg2 = ptb.obj(inputs.lender)?;
-        let change = ptb.command(Command::move_call(
-            inputs.provider_package,
-            id("flash")?,
-            id("repay")?,
-            base,
-            vec![lender_arg2, frcpt, proceeds],
-        ));
-
-        // 6. transfer the change (net profit) to the sender
+        // 5. flash repay (REPAYMENT GATE) + return the profit. Shape depends on provider.
         let recipient = ptb.pure(inputs.sender)?;
-        ptb.command(Command::TransferObjects(vec![change], recipient));
+        match inputs.flash_style {
+            FlashStyle::MockVault => {
+                // flash::repay<T>(lender, receipt, proceeds) -> change; keep the change.
+                let lender_arg2 = ptb.obj(inputs.lender)?;
+                let change = ptb.command(Command::move_call(
+                    inputs.provider_package,
+                    id("flash")?,
+                    id("repay")?,
+                    base,
+                    vec![lender_arg2, frcpt, proceeds],
+                ));
+                ptb.command(Command::TransferObjects(vec![change], recipient));
+            }
+            FlashStyle::Scallop => {
+                // Split exactly repay_total off proceeds; repay_flash_loan(version, market,
+                // owed, loan) consumes the coin (returns nothing); transfer the remainder.
+                let owed_amt = ptb.pure(inputs.repay_total)?;
+                let owed = ptb.command(Command::SplitCoins(proceeds, vec![owed_amt]));
+                let version = ptb.obj(
+                    inputs
+                        .version
+                        .context("scallop flash needs Version object")?,
+                )?;
+                let market = ptb.obj(inputs.lender)?;
+                ptb.command(Command::move_call(
+                    inputs.provider_package,
+                    id(scallop_pins::FLASH_MODULE)?,
+                    id(scallop_pins::REPAY_FN)?,
+                    base,
+                    vec![version, market, nested(owed, 0), frcpt],
+                ));
+                ptb.command(Command::TransferObjects(vec![proceeds], recipient));
+            }
+        }
 
         Ok(ptb.finish())
     }

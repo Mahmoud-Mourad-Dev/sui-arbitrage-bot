@@ -213,15 +213,28 @@ async fn build_ptb(
     }
 
     let lender = resolve_shared(client, &config.flash_lender_id, true).await?;
+    // Provider shape drives the flash call convention: mock vault calls our package's
+    // `flash` module; Scallop calls its `flash_loan` module (needs the Version object).
+    let style = provider.style();
+    let (provider_package, version) = match style {
+        crate::flashloan::FlashStyle::MockVault => (pkg, None),
+        crate::flashloan::FlashStyle::Scallop => (
+            config.scallop_package_id.parse()?,
+            Some(resolve_shared(client, &config.flash_version_id, false).await?),
+        ),
+    };
     let inputs = crate::ptb::BuildInputs {
         package: pkg,
-        provider_package: config.scallop_package_id.parse()?,
+        provider_package,
         base_type,
         lender,
         amount: opp.input_amount,
         min_profit: config.min_profit,
         hops,
         sender,
+        flash_style: style,
+        version,
+        repay_total: provider.repay_total(opp.input_amount),
     };
     crate::ptb::build(&plan, inputs)
 }
