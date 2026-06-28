@@ -1,0 +1,243 @@
+{
+  "__inputs": [
+    {
+      "name": "datasource",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "description": "Prometheus scraping the searcher's /metrics (ARB_METRICS_ADDR, default :9100)"
+    }
+  ],
+  "title": "Sui Searcher — Production Observability",
+  "uid": "sui-searcher-obs",
+  "tags": ["sui", "mev", "searcher"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    { "type": "row", "title": "Latency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
+    {
+      "type": "timeseries",
+      "title": "Stage latency p95 (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (stage, le) (rate(searcher_stage_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC latency p95 by method (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (method, le) (rate(searcher_rpc_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end reaction p50/p95/p99 — executor (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(searcher_stage_latency_seconds_bucket{stage=\"executor\"}[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(searcher_stage_latency_seconds_bucket{stage=\"executor\"}[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(searcher_stage_latency_seconds_bucket{stage=\"executor\"}[5m])))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+
+    { "type": "row", "title": "Throughput", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 } },
+    {
+      "type": "timeseries",
+      "title": "Pools updated / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "targets": [ { "expr": "rate(searcher_pools_updated_total[5m])", "legendFormat": "pools/s", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Candidates generated / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "targets": [ { "expr": "rate(searcher_candidates_generated_total[5m])", "legendFormat": "candidates/s", "refId": "A" } ]
+    },
+
+    { "type": "row", "title": "Opportunity pipeline", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 } },
+    {
+      "type": "timeseries",
+      "title": "Opportunities by kind / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "targets": [ { "expr": "rate(searcher_opportunities_total[5m])", "legendFormat": "{{kind}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejections by reason / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
+      "targets": [ { "expr": "rate(searcher_candidates_rejected_total[5m])", "legendFormat": "{{reason}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dry-run success vs failure / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
+      "targets": [ { "expr": "rate(searcher_dry_run_total[5m])", "legendFormat": "{{result}}", "refId": "A" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Dry-run success ratio (5m)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 35 },
+      "targets": [
+        {
+          "expr": "sum(rate(searcher_dry_run_total{result=\"success\"}[5m])) / clamp_min(sum(rate(searcher_dry_run_total[5m])), 1e-9)",
+          "refId": "A"
+        }
+      ]
+    },
+
+    { "type": "row", "title": "Liquidation pipeline", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 } },
+    {
+      "type": "stat",
+      "title": "Indexed obligations",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 41 },
+      "targets": [ { "expr": "searcher_indexed_obligations", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Liquidation opportunities / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 41 },
+      "targets": [ { "expr": "rate(searcher_opportunities_total{kind=\"liquidation\"}[5m])", "legendFormat": "liq/s", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Liquidation dry-run latency p95 (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 41 },
+      "targets": [ { "expr": "histogram_quantile(0.95, sum by (le) (rate(searcher_stage_latency_seconds_bucket{stage=\"dry_run\"}[5m])))", "legendFormat": "dry_run p95", "refId": "A" } ]
+    },
+
+    { "type": "row", "title": "Profitability", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 } },
+    {
+      "type": "timeseries",
+      "title": "Predicted vs realized net (MIST, cumulative)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        { "expr": "searcher_predicted_net_mist_total", "legendFormat": "predicted", "refId": "A" },
+        { "expr": "searcher_realized_net_mist", "legendFormat": "realized", "refId": "B" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Realized / predicted (<1 = leakage)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.9 } ] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 48 },
+      "targets": [ { "expr": "searcher_realized_vs_predicted", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Executed vs failed tx / s",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 48 },
+      "targets": [
+        { "expr": "rate(searcher_tx_executed_total[15m])", "legendFormat": "executed", "refId": "A" },
+        { "expr": "rate(searcher_tx_failed_total[15m])", "legendFormat": "failed", "refId": "B" }
+      ]
+    },
+
+    { "type": "row", "title": "RPC health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 } },
+    {
+      "type": "stat",
+      "title": "RPC up",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [ { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } } ]
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 57 },
+      "targets": [ { "expr": "searcher_rpc_up", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC latency p99 by method (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 12, "x": 6, "y": 57 },
+      "targets": [ { "expr": "histogram_quantile(0.99, sum by (method, le) (rate(searcher_rpc_latency_seconds_bucket[5m])))", "legendFormat": "{{method}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC calls / s by method",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 57 },
+      "targets": [ { "expr": "sum by (method) (rate(searcher_rpc_latency_seconds_count[5m]))", "legendFormat": "{{method}}", "refId": "A" } ]
+    },
+
+    { "type": "row", "title": "Cache health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 63 } },
+    {
+      "type": "stat",
+      "title": "Cache size",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 64 },
+      "targets": [ { "expr": "searcher_cache_size", "refId": "A" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Tracked pools",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 64 },
+      "targets": [ { "expr": "searcher_tracked_pools", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latest checkpoint (rate ⇒ chain progress)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 64 },
+      "targets": [
+        { "expr": "searcher_latest_checkpoint", "legendFormat": "seq", "refId": "A" },
+        { "expr": "rate(searcher_latest_checkpoint[1m])", "legendFormat": "checkpoints/s", "refId": "B" }
+      ]
+    }
+  ]
+}

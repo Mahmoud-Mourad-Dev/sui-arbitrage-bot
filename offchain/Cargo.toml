@@ -13,9 +13,18 @@ path = "src/lib.rs"
 name = "arb-scanner"
 path = "src/main.rs"
 
+# Operator validation harness: watches the obligation index, builds the production
+# liquidation PTB, and dry-runs it (NEVER submits). Built only with --features liq-validate.
+[[bin]]
+name = "liq-validate"
+path = "src/bin/liq_validate.rs"
+required-features = ["liq-validate"]
+
 [features]
 # Default build is dependency-light and offline: pure quant core + demo scan.
 default = []
+# Liquidation dry-run validation harness (the `liq-validate` binary). Pulls in `live`.
+liq-validate = ["live"]
 # `live` pulls the Sui SDK (heavy git deps) and enables WebSocket ingestion,
 # PTB construction, dry-run, and submission. Pin the SDK rev/branch per network.
 live = [
@@ -38,7 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
 
 # --- live-only (Sui SDK). Optional + git-pinned; not built by default. ---
 sui-sdk = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.73.2", optional = true }

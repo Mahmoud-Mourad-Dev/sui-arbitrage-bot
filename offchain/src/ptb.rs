@@ -42,9 +42,10 @@ pub enum PtbStep {
         min_out: u64,
     },
     /// In-band oracle refresh required before a liquidation reads the protocol's price.
-    /// For Scallop this expands to, per `feed`: `pyth::update_single_price_feed` (fresh
-    /// `PriceInfoObject`, paid) → `x_oracle::price_update_request` →
-    /// `pyth_rule::set_price_as_primary` → `x_oracle::confirm_price_update_request`.
+    /// VERIFIED expansion (doc §4): `vaa::parse_and_verify` →
+    /// `pyth::create_authenticated_price_infos_using_accumulator` → per `feed`
+    /// `pyth::update_single_price_feed` (paid, fresh `PriceInfoObject`) →
+    /// `hot_potato_vector::destroy`. Scallop's `&XOracle` then reads the fresh feeds.
     PriceUpdate { feeds: Vec<String> },
     /// `<protocol>::liquidate(...)` → (remain debt coin, seized collateral coin). The
     /// seized collateral is then swapped back to the debt asset by the following hops.
@@ -200,6 +201,7 @@ mod tests {
             }],
             input_amount: 200_000_000,
             output_amount: 216_000_000,
+            hop_outputs: vec![216_000_000],
             gross_profit: 16_000_000,
             flash_fee: 60_000,
             net_profit: 15_000_000,
@@ -235,6 +237,7 @@ mod tests {
             ],
             input_amount: 1_000_000,
             output_amount: 1_050_000,
+            hop_outputs: vec![1_020_000, 1_035_000, 1_050_000],
             gross_profit: 50_000,
             flash_fee: 300,
             net_profit: 41_700,
@@ -596,18 +599,22 @@ mod live {
         pub version: ObjectArg,
         pub obligation: ObjectArg, // shared, mutable
         pub market: ObjectArg,     // shared, mutable (flash + liquidate share it)
-        pub registry: ObjectArg,   // CoinDecimalsRegistry
-        pub x_oracle: ObjectArg,   // shared, MUTABLE (confirm_price_update_request)
+        pub registry: ObjectArg,   // CoinDecimalsRegistry (immutable)
+        pub x_oracle: ObjectArg,   // XOracle — IMMUTABLE (verified: liquidate takes &XOracle)
         pub clock: ObjectArg,
-        // --- oracle refresh (Scallop x_oracle pyth_rule), verified signatures ---
-        pub x_oracle_package: ObjectID,
-        pub pyth_rule_package: ObjectID,
-        pub pyth_state: ObjectArg,
-        pub pyth_registry: ObjectArg,
-        /// Fresh Pyth `PriceInfoObject`s for the debt + collateral feeds (updated from
-        /// the Hermes bytes earlier in the PTB — see the doc on `build_liquidation`).
-        pub debt_price_info: ObjectArg,
-        pub collateral_price_info: ObjectArg,
+        // --- VERIFIED Pyth accumulator price update (docs/scallop-liquidation-verified.md §4) ---
+        pub wormhole_package: ObjectID, // wormhole pkg (vaa::parse_and_verify)
+        pub pyth_package: ObjectID,     // pyth pkg (pyth + hot_potato_vector)
+        pub wormhole_state: ObjectArg,  // immutable
+        pub pyth_state: ObjectArg,      // immutable
+        /// Wormhole VAA extracted from the Hermes accumulator (`oracle::extract_vaa_from_accumulator`).
+        pub vaa_bytes: Vec<u8>,
+        /// The Hermes accumulator (PNAU) blob consumed by `create_authenticated_price_infos_using_accumulator`.
+        pub accumulator_msg: Vec<u8>,
+        /// MIST split off the gas coin to pay each `update_single_price_feed` call.
+        pub pyth_fee: u64,
+        /// Pyth `PriceInfoObject`s to refresh (debt + collateral feeds), MUTABLE.
+        pub price_infos: Vec<ObjectArg>,
         pub repay_amount: u64,
         /// repay_amount + flash fee, split off `proceeds` to repay the loan exactly.
         pub repay_total: u64,
@@ -631,52 +638,62 @@ mod live {
         let mut ptb = ProgrammableTransactionBuilder::new();
         let debt = vec![inputs.debt_type.clone()];
 
-        // 0. Oracle refresh — MUST precede liquidate (Scallop x_oracle is Pyth-backed and
-        //    staleness-checked). Per asset, the VERIFIED Scallop flow:
-        //      req = x_oracle::price_update_request<Coin>(x_oracle)
-        //      pyth_rule::rule::set_price_as_primary<Coin>(req, pyth_state, price_info, pyth_registry, clock)
-        //      x_oracle::confirm_price_update_request<Coin>(x_oracle, req, clock)
-        //    This threads the real `PriceInfoObject` for each feed. PREREQUISITE: those
-        //    PriceInfoObjects must be freshly updated via `pyth::update_single_price_feed`
-        //    (verified sig) fed by `oracle::fetch_pyth_vaa` bytes; the accumulator ->
-        //    HotPotatoVector constructor is the single call to confirm on-chain at Phase 5,
-        //    so it is intentionally NOT fabricated here (reality-check protocol).
-        let oracle_x = ptb.obj(inputs.x_oracle)?;
-        let oracle_clock = ptb.obj(inputs.clock)?;
-        let pyth_state = ptb.obj(inputs.pyth_state)?;
-        let pyth_registry = ptb.obj(inputs.pyth_registry)?;
-        for (coin_ty, price_info_obj) in [
-            (inputs.debt_type.clone(), inputs.debt_price_info),
-            (inputs.collateral_type.clone(), inputs.collateral_price_info),
-        ] {
-            let price_info = ptb.obj(price_info_obj)?;
-            let ta = vec![coin_ty];
-            let req = ptb.command(Command::move_call(
-                inputs.x_oracle_package,
-                id("x_oracle")?,
-                id("price_update_request")?,
-                ta.clone(),
-                vec![oracle_x],
-            ));
-            ptb.command(Command::move_call(
-                inputs.pyth_rule_package,
-                id("rule")?,
-                id("set_price_as_primary")?,
-                ta.clone(),
-                vec![req, pyth_state, price_info, pyth_registry, oracle_clock],
-            ));
-            ptb.command(Command::move_call(
-                inputs.x_oracle_package,
-                id("x_oracle")?,
-                id("confirm_price_update_request")?,
-                ta,
-                vec![oracle_x, req, oracle_clock],
-            ));
-        }
-
-        // 1. Scallop flash: borrow_flash_loan<Debt>(version, market, amount) -> (Coin, FlashLoan)
+        // Shared refs resolved once (the builder dedups identical ObjectArgs into one input).
+        let clock = ptb.obj(inputs.clock)?;
         let version = ptb.obj(inputs.version)?;
         let market = ptb.obj(inputs.market)?;
+
+        // 0. VERIFIED Pyth accumulator price update (docs/scallop-liquidation-verified.md
+        //    §3/§4; matches successful on-chain liquidation tx AYdhgWMq…):
+        //      vaa::parse_and_verify(wormhole_state, vaa, clock)
+        //      pyth::create_authenticated_price_infos_using_accumulator(pyth_state, acc, vaas, clock) -> HPV
+        //      per feed: update_single_price_feed(pyth_state, HPV, price_info, fee, clock) -> HPV
+        //      hot_potato_vector::destroy<PriceInfo>(HPV)
+        //    This refreshes the Pyth PriceInfoObjects in-band; Scallop's `&XOracle` reads
+        //    them during liquidate. (Replaces the prior x_oracle::price_update_request splice,
+        //    which no successful on-chain liquidation uses — see doc §6.)
+        let wormhole_state = ptb.obj(inputs.wormhole_state)?;
+        let vaa_arg = ptb.pure(inputs.vaa_bytes.clone())?;
+        let verified_vaas = ptb.command(Command::move_call(
+            inputs.wormhole_package,
+            id("vaa")?,
+            id("parse_and_verify")?,
+            vec![],
+            vec![wormhole_state, vaa_arg, clock],
+        ));
+        let pyth_state = ptb.obj(inputs.pyth_state)?;
+        let acc_arg = ptb.pure(inputs.accumulator_msg.clone())?;
+        let mut hpv = ptb.command(Command::move_call(
+            inputs.pyth_package,
+            id("pyth")?,
+            id("create_authenticated_price_infos_using_accumulator")?,
+            vec![],
+            vec![pyth_state, acc_arg, verified_vaas, clock],
+        ));
+        for price_info_obj in inputs.price_infos {
+            let fee_amt = ptb.pure(inputs.pyth_fee)?;
+            let fee = ptb.command(Command::SplitCoins(Argument::GasCoin, vec![fee_amt]));
+            let price_info = ptb.obj(price_info_obj)?;
+            hpv = ptb.command(Command::move_call(
+                inputs.pyth_package,
+                id("pyth")?,
+                id("update_single_price_feed")?,
+                vec![],
+                vec![pyth_state, hpv, price_info, nested(fee, 0), clock],
+            ));
+        }
+        let price_info_ty: TypeTag = format!("{}::price_info::PriceInfo", inputs.pyth_package)
+            .parse()
+            .context("PriceInfo type tag")?;
+        ptb.command(Command::move_call(
+            inputs.pyth_package,
+            id("hot_potato_vector")?,
+            id("destroy")?,
+            vec![price_info_ty],
+            vec![hpv],
+        ));
+
+        // 1. Scallop flash: borrow_flash_loan<Debt>(version, market, amount) -> (Coin, FlashLoan)
         let amount = ptb.pure(inputs.repay_amount)?;
         let borrow = ptb.command(Command::move_call(
             inputs.scallop_package,
@@ -701,20 +718,18 @@ mod live {
         let arcpt = nested(begin, 1);
 
         // 3. protocol::liquidate::liquidate<Debt,Coll>(version, obligation, market, repay,
-        //    registry, x_oracle, clock) -> (remain debt, seized collateral)
-        let version3 = ptb.obj(inputs.version)?;
+        //    registry, x_oracle, clock) -> (remain debt, seized collateral). VERIFIED arg
+        //    order (doc §1/§3).
         let obligation = ptb.obj(inputs.obligation)?;
-        let market3 = ptb.obj(inputs.market)?;
         let registry = ptb.obj(inputs.registry)?;
         let x_oracle = ptb.obj(inputs.x_oracle)?;
-        let clock = ptb.obj(inputs.clock)?;
         let liq = ptb.command(Command::move_call(
             inputs.scallop_package,
             id(scallop_pins::LIQUIDATE_MODULE)?,
             id(scallop_pins::LIQUIDATE_FN)?,
             vec![inputs.debt_type.clone(), inputs.collateral_type.clone()],
             vec![
-                version3, obligation, market3, repay_coin, registry, x_oracle, clock,
+                version, obligation, market, repay_coin, registry, x_oracle, clock,
             ],
         ));
         let remain = nested(liq, 0);
@@ -769,14 +784,12 @@ mod live {
         //    (Scallop's repay consumes the coin + loan and returns nothing).
         let owed_amt = ptb.pure(inputs.repay_total)?;
         let owed = ptb.command(Command::SplitCoins(proceeds, vec![owed_amt]));
-        let version7 = ptb.obj(inputs.version)?;
-        let market7 = ptb.obj(inputs.market)?;
         ptb.command(Command::move_call(
             inputs.scallop_package,
             id(scallop_pins::FLASH_MODULE)?,
             id(scallop_pins::REPAY_FN)?,
             debt,
-            vec![version7, market7, nested(owed, 0), loan],
+            vec![version, market, nested(owed, 0), loan],
         ));
 
         // 8. transfer the remainder (net profit) to the sender
@@ -784,6 +797,156 @@ mod live {
         ptb.command(Command::TransferObjects(vec![proceeds], recipient));
 
         Ok(ptb.finish())
+    }
+}
+
+/// Structural-equivalence test: the assembled liquidation PTB must match the VERIFIED
+/// on-chain Scallop liquidation (docs/scallop-liquidation-verified.md §3) command-for-command
+/// for the Pyth update + liquidate + flash legs. This is the offline proof that the builder
+/// reproduces a known-good transaction shape (a true live `dry_run` additionally needs a live
+/// underwater obligation + fresh Hermes bytes — doc §8).
+#[cfg(all(test, feature = "live"))]
+mod live_tests {
+    use super::live::{build_liquidation, LiquidationInputs, ResolvedHop};
+    use super::PtbStep;
+    use crate::scanner::Protocol;
+    use crate::types::Dex;
+    use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress};
+    use sui_types::transaction::{Argument, Command, ObjectArg, SharedObjectMutability};
+    use sui_types::TypeTag;
+
+    fn oid(n: u64) -> ObjectID {
+        ObjectID::from_hex_literal(&format!("0x{n:x}")).unwrap()
+    }
+    fn shared(n: u64, mutable: bool) -> ObjectArg {
+        ObjectArg::SharedObject {
+            id: oid(n),
+            initial_shared_version: SequenceNumber::from_u64(1),
+            mutability: if mutable {
+                SharedObjectMutability::Mutable
+            } else {
+                SharedObjectMutability::Immutable
+            },
+        }
+    }
+    fn tt(s: &str) -> TypeTag {
+        s.parse().unwrap()
+    }
+
+    /// (module, function) for each MoveCall, in order.
+    fn move_calls(pt: &sui_types::transaction::ProgrammableTransaction) -> Vec<(String, String)> {
+        pt.commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::MoveCall(m) => Some((m.module.to_string(), m.function.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn build() -> sui_types::transaction::ProgrammableTransaction {
+        let debt = "0x2::usdc::USDC";
+        let coll = "0x2::sui::SUI";
+        let swap = ResolvedHop {
+            dex: Dex::Cetus,
+            a_to_b: true,
+            pool: shared(100, true),
+            type_args: vec![tt(coll), tt(debt)],
+            min_out: 0,
+            cetus_config: Some(shared(101, false)),
+            clock: Some(shared(6, false)),
+            turbos_versioned: None,
+        };
+        let inputs = LiquidationInputs {
+            package: oid(1),
+            scallop_package: oid(2),
+            debt_type: tt(debt),
+            collateral_type: tt(coll),
+            version: shared(10, false),
+            obligation: shared(11, true),
+            market: shared(12, true),
+            registry: shared(13, false),
+            x_oracle: shared(14, false),
+            clock: shared(6, false),
+            wormhole_package: oid(20),
+            pyth_package: oid(21),
+            wormhole_state: shared(22, false),
+            pyth_state: shared(23, false),
+            vaa_bytes: vec![1, 0, 0, 0],
+            accumulator_msg: vec![80, 78, 65, 85],
+            pyth_fee: 1,
+            price_infos: vec![shared(30, true), shared(31, true)],
+            repay_amount: 1_000,
+            repay_total: 1_003,
+            min_profit: 1,
+            swap,
+            sender: SuiAddress::ZERO,
+        };
+        let plan = vec![PtbStep::Liquidate {
+            protocol: Protocol::Scallop,
+            obligation_id: "0x11".into(),
+        }];
+        build_liquidation(&plan, inputs).unwrap()
+    }
+
+    #[test]
+    fn liquidation_ptb_matches_verified_onchain_shape() {
+        let pt = build();
+        let calls = move_calls(&pt);
+        let names: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|(m, f)| (m.as_str(), f.as_str()))
+            .collect();
+        // VERIFIED §3/§4 ordering (with our executor::begin/settle_and_return profit gate
+        // wrapping the liquidate — that wrapper is ours, everything else is the on-chain shape).
+        assert_eq!(
+            names,
+            vec![
+                ("vaa", "parse_and_verify"),
+                ("pyth", "create_authenticated_price_infos_using_accumulator"),
+                ("pyth", "update_single_price_feed"), // debt feed
+                ("pyth", "update_single_price_feed"), // collateral feed
+                ("hot_potato_vector", "destroy"),
+                ("flash_loan", "borrow_flash_loan"),
+                ("executor", "begin"),
+                ("liquidate", "liquidate"),
+                ("cetus_adapter", "swap_exact_in_a_to_b"),
+                ("executor", "settle_and_return"),
+                ("flash_loan", "repay_flash_loan"),
+            ]
+        );
+    }
+
+    #[test]
+    fn liquidate_and_pyth_calls_have_verified_arity() {
+        let pt = build();
+        for c in &pt.commands {
+            if let Command::MoveCall(m) = c {
+                match (m.module.as_str(), m.function.as_str()) {
+                    // liquidate<Debt,Coll>(version, obligation, market, repay, registry, x_oracle, clock)
+                    ("liquidate", "liquidate") => {
+                        assert_eq!(m.type_arguments.len(), 2, "liquidate type args");
+                        assert_eq!(m.arguments.len(), 7, "liquidate args");
+                    }
+                    ("vaa", "parse_and_verify") => assert_eq!(m.arguments.len(), 3),
+                    ("pyth", "create_authenticated_price_infos_using_accumulator") => {
+                        assert_eq!(m.arguments.len(), 4)
+                    }
+                    ("pyth", "update_single_price_feed") => assert_eq!(m.arguments.len(), 5),
+                    ("hot_potato_vector", "destroy") => {
+                        assert_eq!(m.type_arguments.len(), 1, "destroy<PriceInfo>")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Each price feed's update fee is split off the GAS coin (verified: SplitCoins(Gas,[1])).
+        let gas_splits = pt
+            .commands
+            .iter()
+            .filter(|c| matches!(c, Command::SplitCoins(Argument::GasCoin, _)))
+            .count();
+        assert_eq!(gas_splits, 2, "one gas-funded fee split per feed");
     }
 }
 

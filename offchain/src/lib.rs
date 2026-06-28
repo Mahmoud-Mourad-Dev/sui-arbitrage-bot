@@ -19,14 +19,20 @@ pub mod config;
 pub mod flashloan;
 pub mod frictions;
 pub mod liquidation;
+pub mod metrics;
 pub mod ptb;
 pub mod risk;
 pub mod scanner;
+pub mod sizing;
 pub mod strategy;
 pub mod types;
 
 #[cfg(feature = "live")]
 pub mod executor;
+#[cfg(feature = "live")]
+pub mod ingest;
+#[cfg(feature = "live")]
+pub mod objcache;
 #[cfg(feature = "live")]
 pub mod quoter;
 #[cfg(feature = "live")]

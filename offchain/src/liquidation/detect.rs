@@ -10,11 +10,14 @@
 //! protocol's authoritative `calculate_liquidation_amounts` read (live path); this
 //! sizer decides whether an obligation is worth that read + builds the `Opportunity`.
 
+use std::collections::HashMap;
+
+use super::health;
 use super::types::{AssetParams, Obligation};
 use crate::clmm::{self, ClmmState};
 use crate::flashloan::quote_fee_bps;
 use crate::scanner::{Hop, LiquidationLeg, OppKind, Opportunity};
-use crate::types::Dex;
+use crate::types::{Dex, PoolKind, PoolState};
 
 /// The CLMM pool used to swap seized collateral back to the debt asset.
 pub struct SwapBack<'a> {
@@ -111,6 +114,76 @@ pub fn size_liquidation(
     best
 }
 
+/// Find a CLMM pool among `pools` that can swap `collateral` → `debt`, oriented so the
+/// swap-back direction is correct. Returns the first match (callers pass the pool set the
+/// ingestion layer keeps hot). Protocol-agnostic — it only needs the two coin types.
+#[must_use]
+pub fn find_swap_back<'a>(
+    pools: &'a [PoolState],
+    collateral: &str,
+    debt: &str,
+) -> Option<SwapBack<'a>> {
+    pools.iter().find_map(|p| {
+        let PoolKind::Clmm(state) = &p.kind else {
+            return None;
+        };
+        if p.token_a == collateral && p.token_b == debt {
+            Some(SwapBack {
+                pool_id: p.id.clone(),
+                dex: p.dex,
+                a_to_b: true,
+                state,
+            })
+        } else if p.token_b == collateral && p.token_a == debt {
+            Some(SwapBack {
+                pool_id: p.id.clone(),
+                dex: p.dex,
+                a_to_b: false,
+                state,
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// Detect the best liquidation `Opportunity` for one obligation: gate on the local health
+/// pre-filter, then size every `(debt, collateral)` pair that has a known swap-back pool
+/// and `AssetParams`, keeping the highest net. `None` if healthy, unpriceable, or no pair
+/// clears `min_profit`. This is the stage-1 selector the live source iterates over.
+#[must_use]
+pub fn detect_obligation(
+    ob: &Obligation,
+    params: &HashMap<String, AssetParams>,
+    pools: &[PoolState],
+    lp: &LiqParams,
+    health_margin: f64,
+) -> Option<Opportunity> {
+    if !health::is_liquidatable(ob, params, health_margin) {
+        return None;
+    }
+    let mut best: Option<Opportunity> = None;
+    for debt in &ob.debts {
+        let Some(dp) = params.get(&debt.coin_type) else {
+            continue;
+        };
+        for coll in &ob.collaterals {
+            let Some(cp) = params.get(&coll.coin_type) else {
+                continue;
+            };
+            let Some(swap) = find_swap_back(pools, &coll.coin_type, &debt.coin_type) else {
+                continue;
+            };
+            if let Some(opp) = size_liquidation(ob, dp, cp, &swap, lp) {
+                if best.as_ref().is_none_or(|b| opp.net_profit > b.net_profit) {
+                    best = Some(opp);
+                }
+            }
+        }
+    }
+    best
+}
+
 #[allow(clippy::too_many_arguments)]
 fn opportunity(
     ob: &Obligation,
@@ -144,6 +217,7 @@ fn opportunity(
         route: vec![hop],
         input_amount: repay,
         output_amount: debt_out,
+        hop_outputs: vec![debt_out],
         gross_profit: debt_out.saturating_sub(repay),
         flash_fee,
         net_profit: net,

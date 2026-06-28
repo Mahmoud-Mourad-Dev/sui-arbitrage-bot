@@ -30,12 +30,12 @@ use crate::types::{Dex, PoolState};
 pub type LiveRegistry = Arc<RwLock<HashMap<String, LivePoolRef>>>;
 
 /// A pool to track, parsed from `config.tracked_pools` (`"<dex>:<object_id>"`).
-struct Tracked {
-    dex: Dex,
-    pool_id: String,
+pub(crate) struct Tracked {
+    pub(crate) dex: Dex,
+    pub(crate) pool_id: String,
 }
 
-fn parse_tracked(entries: &[String]) -> Result<Vec<Tracked>> {
+pub(crate) fn parse_tracked(entries: &[String]) -> Result<Vec<Tracked>> {
     entries
         .iter()
         .map(|e| {
@@ -168,7 +168,7 @@ pub async fn run(
 }
 
 /// Decode a venue pool object into `(PoolState, LivePoolRef)`.
-fn decode_pool(
+pub(crate) fn decode_pool(
     dex: Dex,
     obj: &sui_json_rpc_types::SuiObjectResponse,
 ) -> Result<(PoolState, LivePoolRef)> {

@@ -8,14 +8,27 @@
 //!   * [`detect`] — stage-1 sizing into an `Opportunity` net of swap slippage / fee /
 //!     gas (offline). The *authoritative* sizing/verdict is the protocol's own
 //!     on-chain read, called in the live path.
+//!   * [`source`] — the [`crate::strategy::OpportunitySource`] adapter: reads the shared
+//!     obligation index + asset params and emits liquidation `Opportunity`s (offline).
 //!   * [`index`]  — event-driven obligation index (live).
 //!   * [`oracle`] — protocol oracle (Pyth/x_oracle) prices + freshness (live).
 
 pub mod detect;
 pub mod health;
+pub mod source;
 pub mod types;
 
 #[cfg(feature = "live")]
 pub mod index;
 #[cfg(feature = "live")]
 pub mod oracle;
+/// Operator dry-run validation harness (the `liq-validate` binary). Behind its own feature
+/// so normal builds are unaffected.
+#[cfg(feature = "liq-validate")]
+pub mod validator;
+
+/// Thread-safe obligation index, keyed by obligation object id. Defined here (offline)
+/// so both the live maintainer ([`index`]) and the offline [`source::LiquidationSource`]
+/// share one type. The map holds protocol-agnostic [`types::Obligation`] snapshots.
+pub type ObligationIndex =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, types::Obligation>>>;

@@ -75,6 +75,11 @@ pub struct Opportunity {
     pub route: Vec<Hop>,
     pub input_amount: u64,
     pub output_amount: u64,
+    /// Stage-1 simulated output *after each hop* (same length as `route`; the last
+    /// element equals `output_amount`). The executor derives per-hop `min_out` slippage
+    /// floors from these — so the on-chain `dry_run` of the real PTB is the single
+    /// authoritative re-quote, and no extra per-hop `devInspect` round-trips are needed.
+    pub hop_outputs: Vec<u64>,
     pub gross_profit: u64,
     /// Flash-loan fee charged on `input_amount` (0 when trading owned capital).
     pub flash_fee: u64,
@@ -133,41 +138,97 @@ fn size_route(
     route: &[Hop],
     params: &ScanParams,
 ) -> Option<Opportunity> {
+    if route.is_empty() || params.candidate_inputs.is_empty() {
+        return None;
+    }
+    // Candidate sizes: the explicit grid PLUS the ternary-search optimum over the grid's
+    // [min, max] range. This means a coarse min/max bound is enough — no fine grid needed —
+    // and the optimizer lands on the size that actually maximizes net (so fixed gas stops
+    // dominating). A single-element grid degenerates to exactly that size (no optimizer),
+    // preserving explicit-size semantics.
+    let lo = *params.candidate_inputs.iter().min().expect("non-empty");
+    let hi = *params.candidate_inputs.iter().max().expect("non-empty");
+    let mut candidates = params.candidate_inputs.clone();
+    if hi > lo {
+        if let Some((opt, _)) =
+            crate::sizing::ternary_max(&|x| net_signed(by_id, route, params, x), lo, hi)
+        {
+            candidates.push(opt);
+        }
+    }
+
     let mut best: Option<Opportunity> = None;
-    for &input in &params.candidate_inputs {
-        let Some(output) = simulate(by_id, route, input) else {
+    for input in candidates {
+        let Some(opp) = evaluate_input(by_id, route, params, input) else {
             continue;
         };
-        if output <= input {
-            continue;
-        }
-        let gross_profit = output - input;
-        // Borrowed capital: you owe input + flash_fee, so profit nets the fee too.
-        let flash_fee = if params.flash_fee_bps > 0 {
-            crate::flashloan::quote_fee_bps(input, params.flash_fee_bps)
-        } else {
-            0
-        };
-        let net_profit = gross_profit
-            .saturating_sub(params.gas_cost)
-            .saturating_sub(flash_fee);
-        if net_profit < params.min_profit {
-            continue;
-        }
-        if best.as_ref().is_none_or(|b| net_profit > b.net_profit) {
-            best = Some(Opportunity {
-                kind: OppKind::Arb,
-                liquidation: None,
-                route: route.to_vec(),
-                input_amount: input,
-                output_amount: output,
-                gross_profit,
-                flash_fee,
-                net_profit,
-            });
+        if best.as_ref().is_none_or(|b| opp.net_profit > b.net_profit) {
+            best = Some(opp);
         }
     }
     best
+}
+
+/// Signed net (gross − gas − flash_fee) for one input, or `None` if the route can't be
+/// quoted at that size. Drives the size optimizer, which must see losing sizes to locate
+/// the peak — so it deliberately does NOT apply the `min_profit` floor.
+fn net_signed(
+    by_id: &HashMap<&str, &PoolState>,
+    route: &[Hop],
+    params: &ScanParams,
+    input: u64,
+) -> Option<i128> {
+    let output = simulate(by_id, route, input)?;
+    let flash_fee = if params.flash_fee_bps > 0 {
+        crate::flashloan::quote_fee_bps(input, params.flash_fee_bps)
+    } else {
+        0
+    };
+    Some(
+        i128::from(output)
+            - i128::from(input)
+            - i128::from(params.gas_cost)
+            - i128::from(flash_fee),
+    )
+}
+
+/// Build the `Opportunity` for one input, applying the `min_profit` floor. `None` if the
+/// route can't be quoted, isn't gross-profitable, or doesn't clear `min_profit` net.
+fn evaluate_input(
+    by_id: &HashMap<&str, &PoolState>,
+    route: &[Hop],
+    params: &ScanParams,
+    input: u64,
+) -> Option<Opportunity> {
+    let hop_outputs = simulate_collect(by_id, route, input)?;
+    let output = *hop_outputs.last().expect("non-empty route");
+    if output <= input {
+        return None;
+    }
+    let gross_profit = output - input;
+    // Borrowed capital: you owe input + flash_fee, so profit nets the fee too.
+    let flash_fee = if params.flash_fee_bps > 0 {
+        crate::flashloan::quote_fee_bps(input, params.flash_fee_bps)
+    } else {
+        0
+    };
+    let net_profit = gross_profit
+        .saturating_sub(params.gas_cost)
+        .saturating_sub(flash_fee);
+    if net_profit < params.min_profit {
+        return None;
+    }
+    Some(Opportunity {
+        kind: OppKind::Arb,
+        liquidation: None,
+        route: route.to_vec(),
+        input_amount: input,
+        output_amount: output,
+        hop_outputs,
+        gross_profit,
+        flash_fee,
+        net_profit,
+    })
 }
 
 /// Simulate a fixed route for a given input using exact AMM math. Public wrapper
@@ -181,12 +242,28 @@ pub fn simulate_route(pools: &[PoolState], route: &[Hop], input: u64) -> Option<
 /// Run `input` through every hop with the engine (funnel stage 1). `None` if any
 /// hop can't be quoted.
 fn simulate(by_id: &HashMap<&str, &PoolState>, route: &[Hop], input: u64) -> Option<u64> {
+    simulate_collect(by_id, route, input).map(|outs| *outs.last().expect("non-empty route"))
+}
+
+/// Like [`simulate`] but returns the output *after each hop* (length == `route.len()`),
+/// so callers can derive per-hop `min_out` floors. `None` if the route is empty or any
+/// hop can't be quoted.
+fn simulate_collect(
+    by_id: &HashMap<&str, &PoolState>,
+    route: &[Hop],
+    input: u64,
+) -> Option<Vec<u64>> {
+    if route.is_empty() {
+        return None;
+    }
     let mut amount = input;
+    let mut outs = Vec::with_capacity(route.len());
     for hop in route {
         let pool = by_id.get(hop.pool_id.as_str())?;
         amount = quote_hop(pool, hop, amount)?;
+        outs.push(amount);
     }
-    Some(amount)
+    Some(outs)
 }
 
 /// Price one hop using the pool's native model: V2 → exact `amm` math (bit-identical
@@ -541,5 +618,41 @@ mod tests {
         let opp = find_best(&pools, &params).expect("profitable");
         let repriced = reprice_route(&pools, &opp.route, opp.input_amount, &EngineQuoter).unwrap();
         assert_eq!(repriced, opp.output_amount);
+    }
+
+    #[test]
+    fn dynamic_sizing_matches_brute_force_from_coarse_bounds() {
+        // Given only coarse [min, max] bounds (NOT a fine grid), the optimizer must land
+        // on a size at least as good as a 1000-step brute-force sweep of the same range.
+        let pools = vec![
+            pool("0xAB", "A", "B", 1_000_000, 1_000_000),
+            pool("0xBC", "B", "C", 1_000_000, 1_000_000),
+            pool("0xCA", "C", "A", 1_000_000, 2_000_000),
+        ];
+        let params = ScanParams {
+            base_token: "A".into(),
+            max_hops: 3,
+            candidate_inputs: vec![1, 1_000_000], // just the bounds
+            gas_cost: 0,
+            flash_fee_bps: 0,
+            min_profit: 1,
+        };
+        let opp = find_best(&pools, &params).expect("interior optimum exists");
+        assert!(opp.net_profit > 0);
+        // The chosen size is interior, not pinned to either bound.
+        assert!(opp.input_amount > 1 && opp.input_amount < 1_000_000);
+
+        // Brute-force the same range over the SAME route; the optimizer must tie or beat it.
+        let by_id: HashMap<&str, &PoolState> = pools.iter().map(|p| (p.id.as_str(), p)).collect();
+        let brute = (1..=1_000_000u64)
+            .step_by(1_000)
+            .filter_map(|x| simulate(&by_id, &opp.route, x).map(|o| i128::from(o) - i128::from(x)))
+            .max()
+            .unwrap();
+        assert!(
+            i128::from(opp.net_profit) >= brute,
+            "optimizer net {} < brute-force net {brute}",
+            opp.net_profit
+        );
     }
 }

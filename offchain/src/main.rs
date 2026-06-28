@@ -81,10 +81,12 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
+    use arb_scanner::objcache::ObjRefCache;
     use arb_scanner::risk::{RiskConfig, RiskGuard};
     use arb_scanner::scanner::{self, ScanParams};
     use arb_scanner::ws::LiveRegistry;
-    use arb_scanner::{executor, ws};
+    use arb_scanner::{executor, ingest, ws};
+    use sui_sdk::SuiClientBuilder;
 
     let cache = Arc::new(cache);
     // On-chain object coordinates (pool refs) the quoter/PTB builder need.
@@ -103,17 +105,104 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
     let base_decimals: u32 = 9;
     let base_price_usd: f64 = 1.0;
 
+    // Shared, long-lived RPC client for the executor hot path — built ONCE (no
+    // per-candidate rebuild), plus a shared-object-ref cache so the PTB builder never
+    // re-fetches static object versions per attempt.
+    let client = Arc::new(SuiClientBuilder::default().build(&config.rpc_url).await?);
+    let objcache = ObjRefCache::new();
+
     // 1. Hydrate the cache + registry with current pool state.
     ws::bootstrap_pools(&config, &cache, &registry).await?;
 
-    // 2. Keep the cache + registry hot from the event stream.
+    // 2. Keep the cache + registry hot. `checkpoint` mode watches the chain tip and
+    //    refreshes only changed pools (reusing the shared client); `poll` re-reads all
+    //    tracked pools each interval.
     {
         let cache = cache.clone();
         let registry = registry.clone();
         let config = config.clone();
+        let client = client.clone();
         tokio::spawn(async move {
-            if let Err(e) = ws::run(&config, &cache, &registry).await {
-                tracing::error!(error = %e, "ws task exited");
+            let res = if config.ingest_mode == "checkpoint" {
+                ingest::run_checkpoint_diff(&config, &cache, &registry, &client).await
+            } else {
+                ws::run(&config, &cache, &registry).await
+            };
+            if let Err(e) = res {
+                tracing::error!(error = %e, "ingest task exited");
+            }
+        });
+    }
+
+    // 2b. Liquidation source (optional): an obligation index + oracle-priced asset params,
+    //     both kept fresh by background tasks (like pool ingestion), emitted into the SAME
+    //     executor + risk guard as arb. Gated by ARB_LIQ_ENABLED; submit still gated by
+    //     ARB_SUBMIT_ENABLED (paper by default).
+    let liq_source = if config.liq_enabled {
+        use arb_scanner::liquidation::detect::LiqParams;
+        use arb_scanner::liquidation::source::{self, LiquidationSource, SharedParams};
+        use arb_scanner::liquidation::{self, ObligationIndex};
+
+        let index: ObligationIndex = Arc::new(RwLock::new(HashMap::new()));
+        let params: SharedParams = Arc::new(RwLock::new(HashMap::new()));
+        let metas = source::parse_asset_meta(&config.liq_assets);
+
+        // (a) obligation index: bootstrap once, then RPC reconcile.
+        {
+            let index = index.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = liquidation::index::bootstrap(&config, &index).await {
+                    tracing::warn!(error = %e, "liq index bootstrap failed");
+                }
+                if let Err(e) = liquidation::index::run(&config, &index).await {
+                    tracing::error!(error = %e, "liq index task exited");
+                }
+            });
+        }
+        // (b) params: refresh asset prices from the protocol oracle.
+        {
+            let params = params.clone();
+            let config = config.clone();
+            let client = client.clone();
+            let metas = metas.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    t.tick().await;
+                    if let Err(e) = source::refresh_params(&client, &config, &metas, &params).await
+                    {
+                        tracing::debug!(error = %e, "liq params refresh failed");
+                    }
+                }
+            });
+        }
+
+        let lp = LiqParams {
+            close_factor: config.liq_close_factor,
+            liquidation_bonus: config.liq_bonus,
+            flash_fee_bps: config.flash_fee_bps,
+            gas_cost: config.gas_cost_estimate,
+            min_profit: config.min_profit,
+            candidate_fractions: vec![1.0, 0.75, 0.5, 0.25],
+        };
+        tracing::info!(assets = metas.len(), "liquidation source enabled");
+        Some(LiquidationSource::new(
+            index,
+            params,
+            lp,
+            config.liq_health_margin,
+        ))
+    } else {
+        None
+    };
+
+    // Observability: expose Prometheus /metrics (configurable; empty disables).
+    if !config.metrics_addr.is_empty() {
+        let addr = config.metrics_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = arb_scanner::metrics::serve(&addr).await {
+                tracing::warn!(error = %e, "metrics server exited");
             }
         });
     }
@@ -127,6 +216,8 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
         tick.tick().await;
         ticks += 1;
         let pools = cache.snapshot();
+        arb_scanner::metrics::set_cache_size(pools.len());
+        arb_scanner::metrics::set_tracked_pools(config.tracked_pools.len());
         let params = ScanParams {
             base_token: config.base_token.clone(),
             max_hops: config.max_hops,
@@ -135,7 +226,29 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
             flash_fee_bps: config.flash_fee_bps,
             min_profit: config.min_profit,
         };
-        let found = scanner::find_best(&pools, &params);
+        // Merge every source's opportunities into the one pipeline; execute the best net.
+        let mut candidates: Vec<_> = {
+            use arb_scanner::metrics::{stage_timer, Stage};
+            let _t = stage_timer(Stage::Scanner);
+            scanner::find_best(&pools, &params).into_iter().collect()
+        };
+        if let Some(src) = &liq_source {
+            use arb_scanner::strategy::OpportunitySource;
+            candidates.extend(src.scan(&pools));
+        }
+        if !candidates.is_empty() {
+            arb_scanner::metrics::inc_candidates(candidates.len() as u64);
+            for c in &candidates {
+                arb_scanner::metrics::inc_opportunity(match c.kind {
+                    arb_scanner::scanner::OppKind::Arb => arb_scanner::metrics::Opp::Arb,
+                    arb_scanner::scanner::OppKind::Liquidation => {
+                        arb_scanner::metrics::Opp::Liquidation
+                    }
+                    arb_scanner::scanner::OppKind::Backrun => arb_scanner::metrics::Opp::Backrun,
+                });
+            }
+        }
+        let found = candidates.into_iter().max_by_key(|o| o.net_profit);
         if ticks.is_multiple_of(heartbeat) {
             info!(
                 ticks,
@@ -153,7 +266,10 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
                 hops = opp.route.len(),
                 "candidate — re-quoting + dry-running"
             );
+            let _t = arb_scanner::metrics::stage_timer(arb_scanner::metrics::Stage::Executor);
             if let Err(e) = executor::try_execute(
+                &client,
+                &objcache,
                 &config,
                 &opp,
                 &registry,

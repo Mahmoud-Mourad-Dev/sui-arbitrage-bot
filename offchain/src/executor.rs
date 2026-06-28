@@ -1,35 +1,37 @@
 //! Dry-run + submission (feature = "live").
 //!
 //! Real submit-only-if-profitable path:
-//!   1. Resolve fresh refs; authoritatively re-quote the route (`quoter`). If the edge
-//!      closed, skip — no gas.
-//!   2. Derive per-hop `min_out` floors from the authoritative outputs.
-//!   3. **Build the real PTB** (`ptb::build` / `build_liquidation`) with those floors,
-//!      wrap in `TransactionData`, and **`dry_run_transaction_block`** it. Require
-//!      `effects.status == Success` AND dry-run net (base-coin balance change, which
-//!      nets gas for a SUI base) ≥ `min_profit`. Gas comes from the dry-run, not a flat
-//!      constant.
-//!   4. Consult the [`RiskGuard`]. Then **only if `submit_enabled`**: load the signing
+//!   1. Resolve hop refs from the hot registry (no network) and derive per-hop `min_out`
+//!      floors from the stage-1 simulated hop outputs.
+//!   2. **Build the real PTB** (`ptb::build` / `build_liquidation`) with those floors,
+//!      wrap in `TransactionData`, and **`dry_run_transaction_block`** it — the single
+//!      authoritative re-quote. Require `effects.status == Success` AND dry-run net
+//!      (base-coin balance change, which nets gas for a SUI base) ≥ `min_profit`. Gas comes
+//!      from the dry-run, not a flat constant.
+//!   3. Consult the [`RiskGuard`]. Then **only if `submit_enabled`**: load the signing
 //!      key from a file keystore (never logged), sign, `execute_transaction_block`
 //!      (WaitForLocalExecution), parse landed effects, and `record_realized`.
-//!   5. With `submit_enabled = false` (default) the path still builds + dry-runs, then
+//!   4. With `submit_enabled = false` (default) the path still builds + dry-runs, then
 //!      stops before signing — so the dry-run is always exercised.
+//!
+//! [`validate_opportunity`] exposes step 1–2 (build + dry-run, **never** submit) as a
+//! reusable pre-submit gate — used by the `liq-validate` harness.
 //!
 //! VERIFICATION STATUS: compiles under `--features live` against sui-sdk
 //! `mainnet-v1.73.2`. A real submit additionally needs a published package + a funded
-//! keystore + live pools (testnet, Phase 5); not exercised in offline CI here.
+//! keystore + live pools; not exercised in offline CI here.
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::Config;
-use crate::quoter::{self, LivePoolRef};
+use crate::metrics;
+use crate::objcache::ObjRefCache;
+use crate::quoter::LivePoolRef;
 use crate::risk::{Decision, RiskGuard};
 use crate::scanner::{OppKind, Opportunity};
 use crate::ws::LiveRegistry;
 
-use sui_json_rpc_types::{
-    SuiObjectDataOptions, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions,
-};
+use sui_json_rpc_types::{SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions};
 use sui_sdk::SuiClient;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress};
 use sui_types::object::Owner;
@@ -49,7 +51,10 @@ pub enum Outcome {
 
 /// Evaluate (and maybe submit) one opportunity. `price_usd` converts base-token MIST
 /// to USD for the risk guard; pass the live base/USD price (or 1.0 to gate in MIST).
+#[allow(clippy::too_many_arguments)]
 pub async fn try_execute(
+    client: &SuiClient,
+    objcache: &ObjRefCache,
     config: &Config,
     opp: &Opportunity,
     registry: &LiveRegistry,
@@ -57,11 +62,9 @@ pub async fn try_execute(
     base_decimals: u32,
     price_usd: f64,
 ) -> Result<Outcome> {
-    use sui_sdk::SuiClientBuilder;
-
-    let client = SuiClientBuilder::default().build(&config.rpc_url).await?;
-
-    // 1. Resolve hop refs + authoritative re-quote (stage 2). Engine ranking over-detects.
+    let _span = tracing::info_span!("execute", kind = ?opp.kind, hops = opp.route.len()).entered();
+    // 1. Resolve hop refs from the hot registry — no network (pool versions are kept
+    //    fresh by the ingestion task).
     let refs: Vec<(LivePoolRef, bool)> = {
         let reg = registry.read().expect("registry poisoned");
         opp.route
@@ -74,16 +77,21 @@ pub async fn try_execute(
             })
             .collect::<Result<_>>()?
     };
-    let hop_outs = quoter::authoritative_route_quotes(&client, &refs, opp.input_amount).await?;
-    let final_out = *hop_outs.last().ok_or_else(|| anyhow!("empty route"))?;
-    if final_out <= opp.input_amount {
-        tracing::info!("skip: authoritative re-quote shows no edge");
-        guard.record_skip();
-        return Ok(Outcome::Skipped);
-    }
 
-    // 2. Per-hop min_out floors from the authoritative outputs (never 0).
-    let floors: Vec<u64> = hop_outs
+    // 2. Per-hop min_out floors from the stage-1 simulated hop outputs. The authoritative
+    //    re-quote is now the single on-chain `dry_run` of the REAL PTB below — we no
+    //    longer issue a separate sequential per-hop `devInspect` round-trip (that was
+    //    ~300–500ms and redundant with the dry-run, which prices the exact PTB and gates
+    //    on `net_base >= min_profit`).
+    if opp.hop_outputs.len() != opp.route.len() {
+        bail!(
+            "opportunity hop_outputs ({}) != route hops ({})",
+            opp.hop_outputs.len(),
+            opp.route.len()
+        );
+    }
+    let floors: Vec<u64> = opp
+        .hop_outputs
         .iter()
         .map(|out| apply_slippage_floor(*out, config.per_hop_slippage_bps))
         .collect();
@@ -94,16 +102,31 @@ pub async fn try_execute(
         .parse()
         .context("ARB_SENDER_ADDRESS")?;
     let base_type: TypeTag = config.base_token.parse().context("base token type")?;
-    let pt = build_ptb(&client, config, opp, &refs, &floors, sender).await?;
+    let pt = {
+        let _t = metrics::stage_timer(metrics::Stage::PtbBuild);
+        build_ptb(client, objcache, config, opp, &refs, &floors, sender).await?
+    };
 
-    let gas_price = client.read_api().get_reference_gas_price().await?;
-    let gas_coin = pick_gas_coin(&client, sender).await?;
+    // These two reads are independent — run them concurrently.
+    let (gas_price, gas_coin) = tokio::join!(
+        metrics::time_rpc(
+            metrics::Rpc::GasPrice,
+            client.read_api().get_reference_gas_price()
+        ),
+        pick_gas_coin(client, sender),
+    );
+    let (gas_price, gas_coin) = (gas_price?, gas_coin?);
     let tx_data =
         TransactionData::new_programmable(sender, vec![gas_coin], pt, config.gas_budget, gas_price);
 
-    let dry = dry_run(&client, &tx_data, &base_type, sender).await?;
+    let dry = {
+        let _t = metrics::stage_timer(metrics::Stage::DryRun);
+        dry_run(client, &tx_data, &base_type, sender).await?
+    };
+    metrics::inc_dry_run(dry.success);
     if !dry.success {
         tracing::warn!(?dry, "skip: dry-run reverted");
+        metrics::inc_rejected(metrics::Reject::DryRunRevert);
         guard.record_skip();
         return Ok(Outcome::Skipped);
     }
@@ -114,6 +137,7 @@ pub async fn try_execute(
             gas = dry.gas_used,
             "skip: below min_profit after dry-run"
         );
+        metrics::inc_rejected(metrics::Reject::BelowMinProfit);
         guard.record_skip();
         return Ok(Outcome::Skipped);
     }
@@ -124,10 +148,16 @@ pub async fn try_execute(
     match guard.should_submit(net_usd, &pool_ids) {
         Decision::Skip(reason) => {
             tracing::warn!(reason, net_usd, "skip: risk guard");
+            metrics::inc_rejected(match reason {
+                "blacklisted_pool" => metrics::Reject::Blacklisted,
+                "not_profitable" => metrics::Reject::NotProfitable,
+                _ => metrics::Reject::RiskGuard,
+            });
             guard.record_skip();
             Ok(Outcome::Skipped)
         }
         Decision::Submit => {
+            metrics::add_predicted_net(dry.net_base);
             if !config.submit_enabled {
                 tracing::info!(
                     net_base = dry.net_base,
@@ -138,7 +168,7 @@ pub async fn try_execute(
                 return Ok(Outcome::DryRunOnly);
             }
             submit(
-                &client,
+                client,
                 config,
                 tx_data,
                 &base_type,
@@ -153,10 +183,124 @@ pub async fn try_execute(
     }
 }
 
+/// Result of validating one opportunity with [`validate_opportunity`] — build + dry-run,
+/// never signed/submitted.
+#[derive(Debug, Clone)]
+pub struct ValidationReport {
+    /// PTB was assembled and a dry-run was obtained (vs. failing before that).
+    pub built: bool,
+    /// The dry-run's on-chain effects status was success.
+    pub dry_run_success: bool,
+    /// Stage-1 predicted net (base MIST) from the scanner/sizer.
+    pub predicted_net: i128,
+    /// Dry-run simulated net (sender's base-coin balance change, nets gas for a SUI base).
+    pub simulated_net: i128,
+    /// Real gas used from the dry-run.
+    pub gas_used: u64,
+    /// Set when build or dry-run failed; the reason.
+    pub failure: Option<String>,
+}
+
+/// Build the **production** PTB for `opp` and `dry_run` it — **never signs or submits**.
+/// Reusable as the final pre-submit validation gate (see the `liq-validate` harness and
+/// docs/scallop-liquidation-verified.md §8). Captures every failure as a string rather than
+/// erroring, so a caller can log per-opportunity outcomes without aborting the loop.
+pub async fn validate_opportunity(
+    client: &SuiClient,
+    objcache: &ObjRefCache,
+    config: &Config,
+    opp: &Opportunity,
+    registry: &LiveRegistry,
+) -> ValidationReport {
+    let mut report = ValidationReport {
+        built: false,
+        dry_run_success: false,
+        predicted_net: i128::from(opp.net_profit),
+        simulated_net: 0,
+        gas_used: 0,
+        failure: None,
+    };
+    match build_and_dry_run(client, objcache, config, opp, registry).await {
+        Ok(dry) => {
+            report.built = true;
+            report.dry_run_success = dry.success;
+            report.simulated_net = dry.net_base;
+            report.gas_used = dry.gas_used;
+            if !dry.success {
+                report.failure = Some("dry-run effects status: failure".to_string());
+            }
+        }
+        Err(e) => report.failure = Some(format!("{e:#}")),
+    }
+    report
+}
+
+/// Shared core: resolve refs → floors → build the real PTB → dry-run. Used by both
+/// `try_execute` (then gated/submitted) and `validate_opportunity` (never submitted).
+async fn build_and_dry_run(
+    client: &SuiClient,
+    objcache: &ObjRefCache,
+    config: &Config,
+    opp: &Opportunity,
+    registry: &LiveRegistry,
+) -> Result<DryRun> {
+    let refs: Vec<(LivePoolRef, bool)> = {
+        let reg = registry.read().expect("registry poisoned");
+        opp.route
+            .iter()
+            .map(|h| {
+                reg.get(&h.pool_id)
+                    .cloned()
+                    .map(|r| (r, h.a_to_b))
+                    .ok_or_else(|| anyhow!("no live ref for pool {}", h.pool_id))
+            })
+            .collect::<Result<_>>()?
+    };
+    if opp.hop_outputs.len() != opp.route.len() {
+        bail!(
+            "opportunity hop_outputs ({}) != route hops ({})",
+            opp.hop_outputs.len(),
+            opp.route.len()
+        );
+    }
+    let floors: Vec<u64> = opp
+        .hop_outputs
+        .iter()
+        .map(|out| apply_slippage_floor(*out, config.per_hop_slippage_bps))
+        .collect();
+    let sender: SuiAddress = config
+        .sender_address
+        .parse()
+        .context("ARB_SENDER_ADDRESS")?;
+    let base_type: TypeTag = config.base_token.parse().context("base token type")?;
+    let pt = {
+        let _t = metrics::stage_timer(metrics::Stage::PtbBuild);
+        build_ptb(client, objcache, config, opp, &refs, &floors, sender).await?
+    };
+    let (gas_price, gas_coin) = tokio::join!(
+        metrics::time_rpc(
+            metrics::Rpc::GasPrice,
+            client.read_api().get_reference_gas_price()
+        ),
+        pick_gas_coin(client, sender),
+    );
+    let (gas_price, gas_coin) = (gas_price?, gas_coin?);
+    let tx_data =
+        TransactionData::new_programmable(sender, vec![gas_coin], pt, config.gas_budget, gas_price);
+    let dry = {
+        let _t = metrics::stage_timer(metrics::Stage::DryRun);
+        dry_run(client, &tx_data, &base_type, sender).await?
+    };
+    metrics::inc_dry_run(dry.success);
+    Ok(dry)
+}
+
 /// Build the PTB for this opportunity: liquidation → `build_liquidation`, otherwise the
 /// flash-arb `build`. Resolves all shared-object refs fresh from chain.
+#[allow(clippy::too_many_arguments)]
 async fn build_ptb(
     client: &SuiClient,
+    objcache: &ObjRefCache,
     config: &Config,
     opp: &Opportunity,
     refs: &[(LivePoolRef, bool)],
@@ -167,7 +311,7 @@ async fn build_ptb(
     let pkg: ObjectID = config.package_id.parse().context("ARB_PACKAGE_ID")?;
 
     if opp.kind == OppKind::Liquidation {
-        return build_liquidation_ptb(client, config, opp, refs, floors, sender).await;
+        return build_liquidation_ptb(client, objcache, config, opp, refs, floors, sender).await;
     }
 
     // Flash-arb path (ptb::live::build): borrow → begin → swaps → settle_and_return → repay.
@@ -182,10 +326,12 @@ async fn build_ptb(
     let plan = crate::ptb::flash_arb_plan(provider.as_ref(), opp, config.min_profit);
 
     let clock = clock_arg();
-    let cetus_cfg = resolve_shared(client, &config.cetus_global_config_id, false)
+    let cetus_cfg = objcache
+        .shared_arg(client, &config.cetus_global_config_id, false)
         .await
         .ok();
-    let turbos_ver = resolve_shared(client, &config.turbos_versioned_id, false)
+    let turbos_ver = objcache
+        .shared_arg(client, &config.turbos_versioned_id, false)
         .await
         .ok();
 
@@ -212,7 +358,9 @@ async fn build_ptb(
         });
     }
 
-    let lender = resolve_shared(client, &config.flash_lender_id, true).await?;
+    let lender = objcache
+        .shared_arg(client, &config.flash_lender_id, true)
+        .await?;
     // Provider shape drives the flash call convention: mock vault calls our package's
     // `flash` module; Scallop calls its `flash_loan` module (needs the Version object).
     let style = provider.style();
@@ -220,7 +368,11 @@ async fn build_ptb(
         crate::flashloan::FlashStyle::MockVault => (pkg, None),
         crate::flashloan::FlashStyle::Scallop => (
             config.scallop_package_id.parse()?,
-            Some(resolve_shared(client, &config.flash_version_id, false).await?),
+            Some(
+                objcache
+                    .shared_arg(client, &config.flash_version_id, false)
+                    .await?,
+            ),
         ),
     };
     let inputs = crate::ptb::BuildInputs {
@@ -239,13 +391,16 @@ async fn build_ptb(
     crate::ptb::build(&plan, inputs)
 }
 
-/// Assemble + build the Scallop liquidation PTB (flash → in-PTB oracle refresh →
-/// liquidate → swap-back → settle_and_return → repay). Object ids come from config;
-/// every shared object's initial version is resolved fresh on-chain. Still gated by
-/// `submit_enabled` upstream; the accumulator→`HotPotatoVector` Pyth update is the
-/// remaining on-chain item (see docs/testnet-runbook.md).
+/// Assemble + build the Scallop liquidation PTB (VERIFIED Pyth accumulator refresh →
+/// flash borrow → liquidate → swap-back → settle_and_return → repay). Object ids come from
+/// config (Wormhole/Pyth defaults are the verified mainnet ids); the Hermes accumulator is
+/// fetched + its VAA extracted here. PTB shape is proven by `ptb::live_tests` against the
+/// real on-chain liquidation; final gate is a live `dry_run` (docs/scallop-liquidation-verified.md §8).
+/// Still gated by `submit_enabled` upstream.
+#[allow(clippy::too_many_arguments)]
 async fn build_liquidation_ptb(
     client: &SuiClient,
+    objcache: &ObjRefCache,
     config: &Config,
     opp: &Opportunity,
     refs: &[(LivePoolRef, bool)],
@@ -275,10 +430,12 @@ async fn build_liquidation_ptb(
         .first()
         .ok_or_else(|| anyhow!("liquidation route has no swap hop"))?;
     let clock = clock_arg();
-    let cetus_cfg = resolve_shared(client, &config.cetus_global_config_id, false)
+    let cetus_cfg = objcache
+        .shared_arg(client, &config.cetus_global_config_id, false)
         .await
         .ok();
-    let turbos_ver = resolve_shared(client, &config.turbos_versioned_id, false)
+    let turbos_ver = objcache
+        .shared_arg(client, &config.turbos_versioned_id, false)
         .await
         .ok();
     let mut type_args = vec![lref.type_a.clone(), lref.type_b.clone()];
@@ -300,6 +457,9 @@ async fn build_liquidation_ptb(
         turbos_versioned: turbos_ver,
     };
 
+    // VERIFIED Pyth accumulator flow (docs/scallop-liquidation-verified.md §4): fetch ONE
+    // Hermes accumulator covering the debt + collateral feeds, extract the embedded VAA, and
+    // refresh both PriceInfoObjects in-band before liquidate reads x_oracle.
     let debt_pi = config
         .price_info_object(&leg.debt_type)
         .ok_or_else(|| anyhow!("no PriceInfoObject configured for debt {}", leg.debt_type))?;
@@ -311,30 +471,67 @@ async fn build_liquidation_ptb(
                 leg.collateral_type
             )
         })?;
+    let debt_feed = config
+        .pyth_feed_id(&leg.debt_type)
+        .ok_or_else(|| anyhow!("no Pyth feed id for debt {}", leg.debt_type))?;
+    let coll_feed = config
+        .pyth_feed_id(&leg.collateral_type)
+        .ok_or_else(|| anyhow!("no Pyth feed id for collateral {}", leg.collateral_type))?;
+    let accumulator_msg = metrics::time_rpc(
+        metrics::Rpc::Hermes,
+        crate::liquidation::oracle::fetch_pyth_accumulator(
+            &config.hermes_url,
+            &[debt_feed.to_string(), coll_feed.to_string()],
+        ),
+    )
+    .await?;
+    let vaa_bytes = crate::liquidation::oracle::extract_vaa_from_accumulator(&accumulator_msg)?;
+    // PriceInfoObjects are mutated by update_single_price_feed → resolve them mutable.
+    let price_infos = vec![
+        objcache.shared_arg(client, debt_pi, true).await?,
+        objcache.shared_arg(client, coll_pi, true).await?,
+    ];
 
     let inputs = crate::ptb::LiquidationInputs {
         package: config.package_id.parse().context("ARB_PACKAGE_ID")?,
         scallop_package: config.scallop_package_id.parse()?,
         debt_type,
         collateral_type,
-        version: resolve_shared(client, &config.flash_version_id, false).await?,
-        obligation: resolve_shared(client, &leg.obligation_id, true).await?,
-        market: resolve_shared(client, &config.flash_lender_id, true).await?,
-        registry: resolve_shared(client, &config.scallop_registry_id, false).await?,
-        x_oracle: resolve_shared(client, &config.scallop_x_oracle_id, true).await?,
+        version: objcache
+            .shared_arg(client, &config.flash_version_id, false)
+            .await?,
+        obligation: objcache
+            .shared_arg(client, &leg.obligation_id, true)
+            .await?,
+        market: objcache
+            .shared_arg(client, &config.flash_lender_id, true)
+            .await?,
+        registry: objcache
+            .shared_arg(client, &config.scallop_registry_id, false)
+            .await?,
+        // VERIFIED: liquidate takes `&XOracle` (immutable).
+        x_oracle: objcache
+            .shared_arg(client, &config.scallop_x_oracle_id, false)
+            .await?,
         clock,
-        x_oracle_package: config
-            .x_oracle_package_id
+        wormhole_package: config
+            .wormhole_package_id
             .parse()
-            .context("ARB_X_ORACLE_PACKAGE_ID")?,
-        pyth_rule_package: config
-            .pyth_rule_package_id
+            .context("ARB_WORMHOLE_PACKAGE_ID")?,
+        pyth_package: config
+            .pyth_package_id
             .parse()
-            .context("ARB_PYTH_RULE_PACKAGE_ID")?,
-        pyth_state: resolve_shared(client, &config.pyth_state_id, false).await?,
-        pyth_registry: resolve_shared(client, &config.scallop_pyth_registry_id, false).await?,
-        debt_price_info: resolve_shared(client, debt_pi, false).await?,
-        collateral_price_info: resolve_shared(client, coll_pi, false).await?,
+            .context("ARB_PYTH_PACKAGE_ID")?,
+        wormhole_state: objcache
+            .shared_arg(client, &config.wormhole_state_id, false)
+            .await?,
+        pyth_state: objcache
+            .shared_arg(client, &config.pyth_state_id, false)
+            .await?,
+        vaa_bytes,
+        accumulator_msg,
+        pyth_fee: config.pyth_fee,
+        price_infos,
         repay_amount: leg.repay_amount,
         repay_total,
         min_profit: config.min_profit,
@@ -342,35 +539,6 @@ async fn build_liquidation_ptb(
         sender,
     };
     crate::ptb::build_liquidation(&plan, inputs)
-}
-
-/// Resolve a shared object's `ObjectArg` (fetches its initial shared version fresh).
-async fn resolve_shared(client: &SuiClient, id_str: &str, mutable: bool) -> Result<ObjectArg> {
-    let id: ObjectID = id_str
-        .parse()
-        .with_context(|| format!("object id {id_str}"))?;
-    let resp = client
-        .read_api()
-        .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
-        .await?;
-    let data = resp
-        .data
-        .ok_or_else(|| anyhow!("object {id_str} not found"))?;
-    let initial_shared_version = match data.owner {
-        Some(Owner::Shared {
-            initial_shared_version,
-        }) => initial_shared_version,
-        other => bail!("object {id_str} is not shared: {other:?}"),
-    };
-    Ok(ObjectArg::SharedObject {
-        id,
-        initial_shared_version,
-        mutability: if mutable {
-            SharedObjectMutability::Mutable
-        } else {
-            SharedObjectMutability::Immutable
-        },
-    })
 }
 
 /// The system `Clock` at 0x6 (shared, immutable, initial version 1).
@@ -411,10 +579,11 @@ async fn dry_run(
     base_type: &TypeTag,
     sender: SuiAddress,
 ) -> Result<DryRun> {
-    let resp = client
-        .read_api()
-        .dry_run_transaction_block(tx_data.clone())
-        .await?;
+    let resp = metrics::time_rpc(
+        metrics::Rpc::DryRun,
+        client.read_api().dry_run_transaction_block(tx_data.clone()),
+    )
+    .await?;
     let success = resp.effects.status().is_ok();
     let g = resp.effects.gas_cost_summary();
     let gas_used = g.computation_cost + g.storage_cost
@@ -475,14 +644,16 @@ async fn submit(
     let opts = SuiTransactionBlockResponseOptions::new()
         .with_effects()
         .with_balance_changes();
-    let resp = client
-        .quorum_driver_api()
-        .execute_transaction_block(
+    let _submit_timer = metrics::stage_timer(metrics::Stage::Submit);
+    let resp = metrics::time_rpc(
+        metrics::Rpc::ExecuteTx,
+        client.quorum_driver_api().execute_transaction_block(
             tx,
             opts,
             Some(ExecuteTransactionRequestType::WaitForLocalExecution),
-        )
-        .await?;
+        ),
+    )
+    .await?;
 
     guard.record_submit(predicted_usd);
     // Realized = sender's base-coin balance change from the LANDED effects (negative if
@@ -499,8 +670,16 @@ async fn submit(
             0.0
         };
     guard.record_realized(realized_usd);
+    let landed_ok = resp
+        .effects
+        .as_ref()
+        .map(|e| e.status().is_ok())
+        .unwrap_or(false);
+    metrics::inc_tx(landed_ok);
+    metrics::add_realized_net(realized_base);
     tracing::info!(
         digest = ?resp.digest,
+        landed_ok,
         realized_base,
         realized_usd,
         "submitted; realized recorded"
