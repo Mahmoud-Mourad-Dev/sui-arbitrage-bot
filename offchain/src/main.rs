@@ -111,13 +111,21 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
     let client = Arc::new(SuiClientBuilder::default().build(&config.rpc_url).await?);
     let objcache = ObjRefCache::new();
 
-    // 1. Hydrate the cache + registry with current pool state.
-    ws::bootstrap_pools(&config, &cache, &registry).await?;
-
-    // 2. Keep the cache + registry hot. `checkpoint` mode watches the chain tip and
-    //    refreshes only changed pools (reusing the shared client); `poll` re-reads all
-    //    tracked pools each interval.
-    {
+    // 1+2. Populate + keep the cache/registry hot. With the indexer enabled (default), pools
+    //      are auto-discovered on-chain — ARB_TRACKED_POOLS is ignored. Otherwise, hydrate
+    //      the manual tracked-pool set and refresh it (poll or checkpoint mode).
+    if config.indexer_enabled {
+        let cache = cache.clone();
+        let registry = registry.clone();
+        let config = config.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = arb_scanner::indexer::run(&config, &cache, &registry, &client).await {
+                tracing::error!(error = %e, "indexer task exited");
+            }
+        });
+    } else {
+        ws::bootstrap_pools(&config, &cache, &registry).await?;
         let cache = cache.clone();
         let registry = registry.clone();
         let config = config.clone();

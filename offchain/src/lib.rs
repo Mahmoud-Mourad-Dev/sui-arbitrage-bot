@@ -30,6 +30,8 @@ pub mod types;
 #[cfg(feature = "live")]
 pub mod executor;
 #[cfg(feature = "live")]
+pub mod indexer;
+#[cfg(feature = "live")]
 pub mod ingest;
 #[cfg(feature = "live")]
 pub mod objcache;

@@ -149,6 +149,31 @@ impl Opp {
     }
 }
 
+/// DEX label for the indexer's per-venue discovered-pool gauge.
+#[derive(Clone, Copy, Debug)]
+pub enum IndexDex {
+    Cetus,
+    Turbos,
+    DeepBook,
+    Other,
+}
+impl IndexDex {
+    pub const ALL: [IndexDex; 4] = [
+        IndexDex::Cetus,
+        IndexDex::Turbos,
+        IndexDex::DeepBook,
+        IndexDex::Other,
+    ];
+    fn as_str(self) -> &'static str {
+        match self {
+            IndexDex::Cetus => "cetus",
+            IndexDex::Turbos => "turbos",
+            IndexDex::DeepBook => "deepbook",
+            IndexDex::Other => "other",
+        }
+    }
+}
+
 // ── Primitive instruments ─────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -258,6 +283,8 @@ struct Metrics {
     indexed_obligations: Gauge,
     latest_checkpoint: Gauge,
     rpc_up: Gauge,
+    discovered_total: Gauge,
+    discovered_by_dex: [Gauge; 4],
 }
 impl Metrics {
     fn new() -> Self {
@@ -279,6 +306,8 @@ impl Metrics {
             indexed_obligations: Gauge::default(),
             latest_checkpoint: Gauge::default(),
             rpc_up: Gauge::default(),
+            discovered_total: Gauge::default(),
+            discovered_by_dex: array::from_fn(|_| Gauge::default()),
         }
     }
 }
@@ -342,6 +371,12 @@ pub fn set_latest_checkpoint(seq: u64) {
 }
 pub fn set_rpc_up(up: bool) {
     m().rpc_up.set(i64::from(up));
+}
+pub fn set_discovered_total(n: usize) {
+    m().discovered_total.set(n as i64);
+}
+pub fn set_dex_pools(dex: IndexDex, n: usize) {
+    m().discovered_by_dex[dex as usize].set(n as i64);
 }
 
 /// RAII timer: records the elapsed time into `stage`'s histogram when dropped. Use as
@@ -497,6 +532,21 @@ pub fn render() -> String {
         "RPC reachability (1=up, 0=down).",
         m.rpc_up.get(),
     );
+    gauge(
+        &mut s,
+        "searcher_discovered_pools",
+        "Pools discovered by the indexer (candidate set across all DEXs).",
+        m.discovered_total.get(),
+    );
+    s.push_str("# HELP searcher_discovered_pools_by_dex Active (quotable, kept) pools per DEX.\n");
+    s.push_str("# TYPE searcher_discovered_pools_by_dex gauge\n");
+    for d in IndexDex::ALL {
+        s.push_str(&format!(
+            "searcher_discovered_pools_by_dex{{dex=\"{}\"}} {}\n",
+            d.as_str(),
+            m.discovered_by_dex[d as usize].get()
+        ));
+    }
 
     // Derived: realized / predicted (capture leakage). Only when predicted > 0.
     let pred = m.predicted_net_mist.get();

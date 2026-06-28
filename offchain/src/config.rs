@@ -109,6 +109,21 @@ pub struct Config {
     pub pyth_fee: u64,
     /// `host:port` for the Prometheus `/metrics` endpoint. Empty disables it.
     pub metrics_addr: String,
+    /// Auto-discover pools on-chain instead of using `ARB_TRACKED_POOLS`. When true the
+    /// indexer task discovers + maintains the pool graph; `ARB_TRACKED_POOLS` is ignored.
+    pub indexer_enabled: bool,
+    /// DEXs to index (`cetus`, `turbos`, `deepbook`).
+    pub indexer_dexes: Vec<String>,
+    /// Minimum pool liquidity (raw units) to keep a discovered pool.
+    pub indexer_min_liquidity: u128,
+    /// Cap on the kept (active) pool set per DEX (highest-liquidity first), to bound RPC.
+    pub indexer_max_pools: usize,
+    /// How often (s) to re-scan creation events for newly-listed pools.
+    pub indexer_discovery_secs: u64,
+    /// How often (s) to refresh the active pool set's state (poll mode).
+    pub indexer_refresh_secs: u64,
+    /// Optional allowlist: keep only pools containing one of these coin types (empty = all).
+    pub indexer_quote_tokens: Vec<String>,
 }
 
 impl Config {
@@ -176,6 +191,20 @@ impl Config {
             hermes_url: env_or("ARB_HERMES_URL", "https://hermes.pyth.network"),
             pyth_fee: env_parse("ARB_PYTH_FEE", 1)?,
             metrics_addr: env_or("ARB_METRICS_ADDR", "0.0.0.0:9100"),
+            indexer_enabled: env_parse("ARB_INDEXER_ENABLED", true)?,
+            indexer_dexes: {
+                let d = env_list("ARB_INDEXER_DEXES");
+                if d.is_empty() {
+                    vec!["cetus".to_string(), "turbos".to_string()]
+                } else {
+                    d
+                }
+            },
+            indexer_min_liquidity: env_parse("ARB_INDEXER_MIN_LIQUIDITY", 0u128)?,
+            indexer_max_pools: env_parse("ARB_INDEXER_MAX_POOLS", 300)?,
+            indexer_discovery_secs: env_parse("ARB_INDEXER_DISCOVERY_SECS", 300)?,
+            indexer_refresh_secs: env_parse("ARB_INDEXER_REFRESH_SECS", 10)?,
+            indexer_quote_tokens: env_list("ARB_INDEXER_QUOTE_TOKENS"),
         })
     }
 
