@@ -165,8 +165,14 @@ impl Config {
             ),
             keystore_path: env_or("ARB_KEYSTORE_PATH", ""),
             sender_address: env_or("ARB_SENDER_ADDRESS", "0x0"),
-            cetus_global_config_id: env_or("ARB_CETUS_GLOBAL_CONFIG_ID", "0x0"),
-            turbos_versioned_id: env_or("ARB_TURBOS_VERSIONED_ID", "0x0"),
+            cetus_global_config_id: env_or(
+                "ARB_CETUS_GLOBAL_CONFIG_ID",
+                "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f",
+            ),
+            turbos_versioned_id: env_or(
+                "ARB_TURBOS_VERSIONED_ID",
+                "0xf1cf0e81048df168ebeb1b8030fad24b3e0b53ae827c25053fff0779c1445b6f",
+            ),
             x_oracle_package_id: env_or("ARB_X_ORACLE_PACKAGE_ID", "0x0"),
             pyth_rule_package_id: env_or(
                 "ARB_PYTH_RULE_PACKAGE_ID",

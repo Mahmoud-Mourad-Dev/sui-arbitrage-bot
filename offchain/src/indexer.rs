@@ -177,9 +177,14 @@ fn pair_allowed(state: &PoolState, quote_tokens: &[String]) -> bool {
 const MAX_DISCOVER: usize = 5_000;
 
 /// Page a DEX's creation events into pool object ids (deduped, capped).
+///
+/// Uses `MoveEventModule` (events whose *type* is defined in the factory module) — NOT
+/// `MoveModule` (events *emitted by* that module). Pool creations are typically driven by a
+/// router/creator that calls the factory, so `MoveModule{factory}` matches nothing; the
+/// event type is still `factory::CreatePoolEvent`, which `MoveEventModule` matches.
 async fn discover_ids(client: &SuiClient, spec: &EventSpec) -> Result<Vec<String>> {
     use sui_json_rpc_types::EventFilter;
-    let filter = EventFilter::MoveModule {
+    let filter = EventFilter::MoveEventModule {
         package: spec.package.parse()?,
         module: spec.module.parse()?,
     };
@@ -187,13 +192,23 @@ async fn discover_ids(client: &SuiClient, spec: &EventSpec) -> Result<Vec<String
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
     loop {
-        let page = metrics::time_rpc(
+        let page = match metrics::time_rpc(
             Rpc::QueryEvents,
             client
                 .event_api()
                 .query_events(filter.clone(), cursor, Some(200), false),
         )
-        .await?;
+        .await
+        {
+            Ok(p) => {
+                metrics::set_rpc_up(true);
+                p
+            }
+            Err(e) => {
+                metrics::set_rpc_up(false);
+                return Err(e.into());
+            }
+        };
         for ev in &page.data {
             if let Some(id) = ev
                 .parsed_json
@@ -224,47 +239,58 @@ async fn sync_pools(
     registry: &LiveRegistry,
     cap: usize,
 ) -> Vec<String> {
+    use futures_util::stream::{self, StreamExt};
+
     let opts = SuiObjectDataOptions::new()
         .with_content()
         .with_type()
         .with_owner();
     let mut kept: Vec<(PoolState, LivePoolRef, u128)> = Vec::new();
 
-    for chunk in ids.chunks(50) {
-        let oids: Vec<ObjectID> = chunk.iter().filter_map(|s| s.parse().ok()).collect();
-        if oids.is_empty() {
-            continue;
-        }
-        let objs = match metrics::time_rpc(
-            Rpc::MultiGetObject,
-            client
-                .read_api()
-                .multi_get_object_with_options(oids, opts.clone()),
-        )
-        .await
-        {
-            Ok(o) => {
+    // Fetch object batches with BOUNDED concurrency so bootstrap (thousands of pools) takes
+    // seconds, not minutes — without flooding the RPC. Decode happens after each batch lands.
+    let chunks: Vec<Vec<ObjectID>> = ids
+        .chunks(50)
+        .map(|c| c.iter().filter_map(|s| s.parse().ok()).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let batches = stream::iter(chunks)
+        .map(|oids| {
+            let opts = opts.clone();
+            async move {
+                metrics::time_rpc(
+                    Rpc::MultiGetObject,
+                    client.read_api().multi_get_object_with_options(oids, opts),
+                )
+                .await
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+
+    for res in batches {
+        match res {
+            Ok(objs) => {
                 metrics::set_rpc_up(true);
-                o
+                for obj in &objs {
+                    match adapter.decode(obj) {
+                        Ok((state, lref)) => {
+                            let liq = liquidity_of(&state);
+                            if liq >= config.indexer_min_liquidity
+                                && pair_allowed(&state, &config.indexer_quote_tokens)
+                                && adapter.normalize(&state)
+                            {
+                                kept.push((state, lref, liq));
+                            }
+                        }
+                        Err(e) => tracing::debug!(dex = adapter.label(), "decode skipped: {e}"),
+                    }
+                }
             }
             Err(e) => {
                 metrics::set_rpc_up(false);
                 tracing::warn!(dex = adapter.label(), "indexer batch read failed: {e}");
-                continue;
-            }
-        };
-        for obj in &objs {
-            match adapter.decode(obj) {
-                Ok((state, lref)) => {
-                    let liq = liquidity_of(&state);
-                    if liq >= config.indexer_min_liquidity
-                        && pair_allowed(&state, &config.indexer_quote_tokens)
-                        && adapter.normalize(&state)
-                    {
-                        kept.push((state, lref, liq));
-                    }
-                }
-                Err(e) => tracing::debug!(dex = adapter.label(), "decode skipped: {e}"),
             }
         }
     }
