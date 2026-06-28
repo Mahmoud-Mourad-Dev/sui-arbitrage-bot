@@ -297,6 +297,17 @@ async fn sync_pools(
 
     kept.sort_by_key(|k| std::cmp::Reverse(k.2));
     kept.truncate(cap);
+    if !kept.is_empty() {
+        let n = kept.len();
+        tracing::debug!(
+            dex = adapter.label(),
+            kept = n,
+            liq_max = kept.first().map(|k| k.2).unwrap_or(0),
+            liq_p50 = kept.get(n / 2).map(|k| k.2).unwrap_or(0),
+            liq_min = kept.last().map(|k| k.2).unwrap_or(0),
+            "kept-pool liquidity distribution"
+        );
+    }
     let mut active = Vec::with_capacity(kept.len());
     for (state, lref, _) in kept {
         let id = state.id.clone();
