@@ -17,7 +17,8 @@
 //! Modes: `poll` (RPC, implemented here) and `checkpoint` (future fullnode stream — the
 //! `sync` seam below is where it plugs in, mirroring `ingest::run_checkpoint_diff`).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,11 +27,20 @@ use sui_sdk::SuiClient;
 use sui_types::base_types::ObjectID;
 
 use crate::cache::ReserveCache;
+use crate::clmm::TickBoundary;
 use crate::config::Config;
 use crate::metrics::{self, IndexDex, Rpc};
 use crate::quoter::LivePoolRef;
 use crate::types::{Dex, PoolKind, PoolState};
 use crate::ws::{self, LiveRegistry};
+
+/// Per-pool cache of decoded Cetus ticks (pool id → windowed ticks). Populated on the
+/// discovery cycle and reused on the fast refresh so tick reads are infrequent, not per-tick.
+type TickCache = Arc<RwLock<HashMap<String, Vec<TickBoundary>>>>;
+
+/// A kept pool pending tick injection: state, live ref, liquidity, and (for Cetus with tick
+/// loading on) its `(tick-SkipList UID, current score)` for windowed loading.
+type KeptPool = (PoolState, LivePoolRef, u128, Option<(ObjectID, u64)>);
 
 /// The pool-creation event that announces new pools for a DEX.
 pub struct EventSpec {
@@ -260,6 +270,7 @@ async fn discover_ids(client: &SuiClient, spec: &EventSpec) -> Result<Vec<String
 
 /// Decode + filter `ids` for one adapter, upsert the kept pools into the cache + registry,
 /// and return the kept ids (highest-liquidity first, capped at `cap`). Batched object reads.
+#[allow(clippy::too_many_arguments)]
 async fn sync_pools(
     client: &SuiClient,
     adapter: &dyn PoolAdapter,
@@ -268,6 +279,8 @@ async fn sync_pools(
     cache: &Arc<ReserveCache>,
     registry: &LiveRegistry,
     cap: usize,
+    tick_cache: &TickCache,
+    refetch_ticks: bool,
 ) -> Vec<String> {
     use futures_util::stream::{self, StreamExt};
 
@@ -275,8 +288,9 @@ async fn sync_pools(
         .with_content()
         .with_type()
         .with_owner();
-    // 4th field: the Cetus tick-SkipList UID (Some only when tick loading is on + Cetus).
-    let mut kept: Vec<(PoolState, LivePoolRef, u128, Option<ObjectID>)> = Vec::new();
+    // 4th field: for a Cetus pool (when tick loading is on), its tick-SkipList UID + the
+    // current skip-list score (to center the window). `None` for non-Cetus / loading off.
+    let mut kept: Vec<KeptPool> = Vec::new();
 
     // Fetch object batches with BOUNDED concurrency so bootstrap (thousands of pools) takes
     // seconds, not minutes — without flooding the RPC. Decode happens after each batch lands.
@@ -315,6 +329,7 @@ async fn sync_pools(
                                 let skid =
                                     if config.indexer_load_ticks && adapter.dex() == Dex::Cetus {
                                         crate::cetus_ticks::skiplist_id(obj)
+                                            .zip(crate::cetus_ticks::current_score(obj))
                                     } else {
                                         None
                                     };
@@ -347,49 +362,83 @@ async fn sync_pools(
     }
 
     // Tick ingestion (Cetus only): replace the empty single-range approximation with the
-    // pool's real initialized ticks. CRITICAL: if a Cetus pool's ticks fail to load (RPC
-    // error, or empty result), we DROP the pool rather than fall back to empty ticks — empty
-    // ticks silently over-quote, which is exactly the bug this fixes. Turbos (skid=None) is
-    // unchanged. Bounded concurrency.
+    // pool's real initialized ticks near the current price. RELIABILITY:
+    //   * cached per pool — the fast refresh REUSES cache (no RPC); only the discovery cycle
+    //     (`refetch_ticks`) re-fetches, so tick reads are infrequent;
+    //   * windowed — only the ticks a realistic swap can cross are fetched;
+    //   * exponential backoff on transient RPC error (429), then fall back to STALE cache;
+    //   * a pool is DROPPED only if it has no cached ticks AND the load fails/empties — we
+    //     never fall back to empty ticks (which silently over-quote). Turbos: unchanged.
     let kept: Vec<(PoolState, LivePoolRef, u128)> = if config.indexer_load_ticks {
         use futures_util::stream::{self, StreamExt};
+        let window = config.indexer_max_ticks;
         stream::iter(kept)
-            .map(|(mut state, lref, liq, skid)| async move {
-                let Some(sk) = skid else {
-                    return Some((state, lref, liq)); // non-Cetus (e.g. Turbos): unchanged
-                };
-                match crate::cetus_ticks::load(client, sk, config.indexer_max_ticks).await {
-                    Ok(ticks) if !ticks.is_empty() => {
-                        let n = ticks.len();
-                        let first = ticks.first().map(|t| t.sqrt_price).unwrap_or(0);
-                        let last = ticks.last().map(|t| t.sqrt_price).unwrap_or(0);
-                        let (q_before, q_after) = tick_quote_compare(&state, &ticks);
-                        inject_ticks(&mut state, ticks);
-                        tracing::info!(
-                            pool = %state.id,
-                            cur_sqrt = clmm_sqrt(&state),
-                            ticks = n,
-                            first_sqrt = first,
-                            last_sqrt = last,
-                            q_before,
-                            q_after,
-                            crosses = (q_before != q_after),
-                            "cetus ticks loaded"
-                        );
-                        Some((state, lref, liq))
+            .map(|(mut state, lref, liq, skid)| {
+                let tick_cache = Arc::clone(tick_cache);
+                async move {
+                    let Some((sk, score)) = skid else {
+                        return Some((state, lref, liq)); // non-Cetus (e.g. Turbos): unchanged
+                    };
+                    let cached = tick_cache.read().expect("tick cache poisoned").get(&state.id).cloned();
+
+                    // Fast refresh with a warm cache: reuse, no RPC.
+                    if !refetch_ticks {
+                        if let Some(ticks) = cached {
+                            inject_ticks(&mut state, ticks);
+                            return Some((state, lref, liq));
+                        }
                     }
-                    // Drop the pool (no empty-tick fallback): it will be retried next refresh.
-                    Ok(_) => {
-                        tracing::warn!(pool = %state.id, "cetus pool DROPPED: 0 ticks loaded");
-                        None
+
+                    // (Re)fetch the window, with exponential backoff on transient errors
+                    // (chiefly RPC `429` during the bootstrap burst). Per-pool jitter desyncs
+                    // retries so they don't all hammer the RPC on the same beat.
+                    let mut res = crate::cetus_ticks::load_window(client, sk, score, window).await;
+                    let jitter = state.id.bytes().map(u64::from).sum::<u64>() % 200;
+                    let mut delay = 250u64;
+                    for _ in 0..3 {
+                        if res.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
+                        res = crate::cetus_ticks::load_window(client, sk, score, window).await;
+                        delay *= 3;
                     }
-                    Err(e) => {
-                        tracing::warn!(pool = %state.id, "cetus pool DROPPED: tick load failed: {e}");
-                        None
+                    match res {
+                        Ok(ticks) if !ticks.is_empty() => {
+                            let n = ticks.len();
+                            let (q_before, q_after) = tick_quote_compare(&state, &ticks);
+                            tick_cache
+                                .write()
+                                .expect("tick cache poisoned")
+                                .insert(state.id.clone(), ticks.clone());
+                            inject_ticks(&mut state, ticks);
+                            tracing::info!(
+                                pool = %state.id, cur_sqrt = clmm_sqrt(&state), ticks = n,
+                                q_before, q_after, crosses = (q_before != q_after),
+                                "cetus ticks loaded"
+                            );
+                            Some((state, lref, liq))
+                        }
+                        // Load failed/empty: reuse stale cache if present, else drop.
+                        other => {
+                            if let Some(ticks) = cached {
+                                inject_ticks(&mut state, ticks);
+                                tracing::debug!(pool = %state.id, "cetus ticks: reused stale cache (refetch failed)");
+                                Some((state, lref, liq))
+                            } else {
+                                match other {
+                                    Err(e) => tracing::warn!(pool = %state.id, "cetus pool DROPPED: tick load failed: {e}"),
+                                    _ => tracing::warn!(pool = %state.id, "cetus pool DROPPED: 0 ticks"),
+                                }
+                                None
+                            }
+                        }
                     }
                 }
             })
-            .buffer_unordered(6)
+            // Modest concurrency: the bootstrap fans out over all Cetus pools at once; too
+            // many parallel tick loads trip RPC rate limits (429). Cached afterwards.
+            .buffer_unordered(3)
             .collect::<Vec<Option<_>>>()
             .await
             .into_iter()
@@ -437,6 +486,8 @@ pub async fn run(
     // Per-adapter candidate id sets + active id sets.
     let mut candidates: Vec<Vec<String>> = vec![Vec::new(); adapters.len()];
     let mut active: Vec<Vec<String>> = vec![Vec::new(); adapters.len()];
+    // Shared Cetus tick cache: filled on discovery, reused on the fast refresh.
+    let tick_cache: TickCache = Arc::new(RwLock::new(HashMap::new()));
 
     // Bootstrap: discover + build the active set for every adapter.
     for (i, a) in adapters.iter().enumerate() {
@@ -460,6 +511,8 @@ pub async fn run(
                 cache,
                 registry,
                 config.indexer_max_pools,
+                &tick_cache,
+                true, // bootstrap: fetch ticks
             )
             .await;
         } else {
@@ -489,6 +542,8 @@ pub async fn run(
                         cache,
                         registry,
                         config.indexer_max_pools,
+                        &tick_cache,
+                        true, // discovery: refetch ticks
                     )
                     .await;
                 }
@@ -506,6 +561,8 @@ pub async fn run(
                         cache,
                         registry,
                         config.indexer_max_pools,
+                        &tick_cache,
+                        false, // fast refresh: reuse cached ticks
                     )
                     .await;
                 }
