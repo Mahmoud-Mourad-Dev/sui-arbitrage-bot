@@ -173,6 +173,36 @@ fn pair_allowed(state: &PoolState, quote_tokens: &[String]) -> bool {
             .any(|t| t == &state.token_a || t == &state.token_b)
 }
 
+/// Replace a CLMM pool's tick set in place (no-op for V2).
+fn inject_ticks(state: &mut PoolState, ticks: Vec<crate::clmm::TickBoundary>) {
+    if let PoolKind::Clmm(c) = &mut state.kind {
+        c.ticks = ticks;
+    }
+}
+
+/// Current sqrt-price of a CLMM pool (0 for V2), for diagnostics.
+fn clmm_sqrt(state: &PoolState) -> u128 {
+    match &state.kind {
+        PoolKind::Clmm(c) => c.sqrt_price,
+        PoolKind::V2 { .. } => 0,
+    }
+}
+
+/// Diagnostic: quote a representative large input with the empty single-range approximation
+/// vs. with the loaded ticks — shows the over-quote shrinking to reality.
+fn tick_quote_compare(state: &PoolState, ticks: &[crate::clmm::TickBoundary]) -> (u64, u64) {
+    let PoolKind::Clmm(base) = &state.kind else {
+        return (0, 0);
+    };
+    const SAMPLE_IN: u64 = 100_000_000_000; // 1e11 raw units — large enough to expose over-quote
+    let empty = base.clone(); // ticks are still empty at this point
+    let mut with_ticks = base.clone();
+    with_ticks.ticks = ticks.to_vec();
+    let before = crate::clmm::quote_exact_in(&empty, SAMPLE_IN, true).unwrap_or(0);
+    let after = crate::clmm::quote_exact_in(&with_ticks, SAMPLE_IN, true).unwrap_or(0);
+    (before, after)
+}
+
 /// Hard cap on ids held per DEX (bounds memory for very large venues).
 const MAX_DISCOVER: usize = 5_000;
 
@@ -245,7 +275,8 @@ async fn sync_pools(
         .with_content()
         .with_type()
         .with_owner();
-    let mut kept: Vec<(PoolState, LivePoolRef, u128)> = Vec::new();
+    // 4th field: the Cetus tick-SkipList UID (Some only when tick loading is on + Cetus).
+    let mut kept: Vec<(PoolState, LivePoolRef, u128, Option<ObjectID>)> = Vec::new();
 
     // Fetch object batches with BOUNDED concurrency so bootstrap (thousands of pools) takes
     // seconds, not minutes — without flooding the RPC. Decode happens after each batch lands.
@@ -281,7 +312,13 @@ async fn sync_pools(
                                 && pair_allowed(&state, &config.indexer_quote_tokens)
                                 && adapter.normalize(&state)
                             {
-                                kept.push((state, lref, liq));
+                                let skid =
+                                    if config.indexer_load_ticks && adapter.dex() == Dex::Cetus {
+                                        crate::cetus_ticks::skiplist_id(obj)
+                                    } else {
+                                        None
+                                    };
+                                kept.push((state, lref, liq, skid));
                             }
                         }
                         Err(e) => tracing::debug!(dex = adapter.label(), "decode skipped: {e}"),
@@ -308,6 +345,46 @@ async fn sync_pools(
             "kept-pool liquidity distribution"
         );
     }
+
+    // Tick ingestion (Cetus only): replace the empty single-range approximation with the
+    // pool's real initialized ticks, so Stage-1 quotes are realistic. Bounded concurrency.
+    let kept: Vec<(PoolState, LivePoolRef, u128)> = if config.indexer_load_ticks {
+        use futures_util::stream::{self, StreamExt};
+        stream::iter(kept)
+            .map(|(mut state, lref, liq, skid)| async move {
+                if let Some(sk) = skid {
+                    match crate::cetus_ticks::load(client, sk, config.indexer_max_ticks).await {
+                        Ok(ticks) if !ticks.is_empty() => {
+                            let n = ticks.len();
+                            let first = ticks.first().map(|t| t.sqrt_price).unwrap_or(0);
+                            let last = ticks.last().map(|t| t.sqrt_price).unwrap_or(0);
+                            let (q_before, q_after) = tick_quote_compare(&state, &ticks);
+                            inject_ticks(&mut state, ticks);
+                            tracing::info!(
+                                pool = %state.id,
+                                cur_sqrt = clmm_sqrt(&state),
+                                ticks = n,
+                                first_sqrt = first,
+                                last_sqrt = last,
+                                q_before,
+                                q_after,
+                                crosses = (q_before != q_after),
+                                "cetus ticks loaded"
+                            );
+                        }
+                        Ok(_) => tracing::debug!(pool = %state.id, "no initialized ticks"),
+                        Err(e) => tracing::debug!(pool = %state.id, "tick load failed: {e}"),
+                    }
+                }
+                (state, lref, liq)
+            })
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await
+    } else {
+        kept.into_iter().map(|(s, l, q, _)| (s, l, q)).collect()
+    };
+
     let mut active = Vec::with_capacity(kept.len());
     for (state, lref, _) in kept {
         let id = state.id.clone();

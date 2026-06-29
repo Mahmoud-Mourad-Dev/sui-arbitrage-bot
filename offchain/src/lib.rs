@@ -28,6 +28,8 @@ pub mod strategy;
 pub mod types;
 
 #[cfg(feature = "live")]
+pub mod cetus_ticks;
+#[cfg(feature = "live")]
 pub mod executor;
 #[cfg(feature = "live")]
 pub mod indexer;

@@ -124,6 +124,11 @@ pub struct Config {
     pub indexer_refresh_secs: u64,
     /// Optional allowlist: keep only pools containing one of these coin types (empty = all).
     pub indexer_quote_tokens: Vec<String>,
+    /// Load real CLMM tick liquidity for Cetus pools (so Stage-1 quotes traverse initialized
+    /// ticks instead of one infinite range). RPC-heavy; default off. Turbos unaffected.
+    pub indexer_load_ticks: bool,
+    /// Max initialized ticks to load per pool when `indexer_load_ticks` is on.
+    pub indexer_max_ticks: usize,
 }
 
 impl Config {
@@ -211,6 +216,8 @@ impl Config {
             indexer_discovery_secs: env_parse("ARB_INDEXER_DISCOVERY_SECS", 300)?,
             indexer_refresh_secs: env_parse("ARB_INDEXER_REFRESH_SECS", 10)?,
             indexer_quote_tokens: env_list("ARB_INDEXER_QUOTE_TOKENS"),
+            indexer_load_ticks: env_parse("ARB_INDEXER_LOAD_TICKS", false)?,
+            indexer_max_ticks: env_parse("ARB_INDEXER_MAX_TICKS", 512)?,
         })
     }
 
