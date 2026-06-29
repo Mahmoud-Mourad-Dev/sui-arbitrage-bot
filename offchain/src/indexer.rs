@@ -347,40 +347,54 @@ async fn sync_pools(
     }
 
     // Tick ingestion (Cetus only): replace the empty single-range approximation with the
-    // pool's real initialized ticks, so Stage-1 quotes are realistic. Bounded concurrency.
+    // pool's real initialized ticks. CRITICAL: if a Cetus pool's ticks fail to load (RPC
+    // error, or empty result), we DROP the pool rather than fall back to empty ticks — empty
+    // ticks silently over-quote, which is exactly the bug this fixes. Turbos (skid=None) is
+    // unchanged. Bounded concurrency.
     let kept: Vec<(PoolState, LivePoolRef, u128)> = if config.indexer_load_ticks {
         use futures_util::stream::{self, StreamExt};
         stream::iter(kept)
             .map(|(mut state, lref, liq, skid)| async move {
-                if let Some(sk) = skid {
-                    match crate::cetus_ticks::load(client, sk, config.indexer_max_ticks).await {
-                        Ok(ticks) if !ticks.is_empty() => {
-                            let n = ticks.len();
-                            let first = ticks.first().map(|t| t.sqrt_price).unwrap_or(0);
-                            let last = ticks.last().map(|t| t.sqrt_price).unwrap_or(0);
-                            let (q_before, q_after) = tick_quote_compare(&state, &ticks);
-                            inject_ticks(&mut state, ticks);
-                            tracing::info!(
-                                pool = %state.id,
-                                cur_sqrt = clmm_sqrt(&state),
-                                ticks = n,
-                                first_sqrt = first,
-                                last_sqrt = last,
-                                q_before,
-                                q_after,
-                                crosses = (q_before != q_after),
-                                "cetus ticks loaded"
-                            );
-                        }
-                        Ok(_) => tracing::debug!(pool = %state.id, "no initialized ticks"),
-                        Err(e) => tracing::debug!(pool = %state.id, "tick load failed: {e}"),
+                let Some(sk) = skid else {
+                    return Some((state, lref, liq)); // non-Cetus (e.g. Turbos): unchanged
+                };
+                match crate::cetus_ticks::load(client, sk, config.indexer_max_ticks).await {
+                    Ok(ticks) if !ticks.is_empty() => {
+                        let n = ticks.len();
+                        let first = ticks.first().map(|t| t.sqrt_price).unwrap_or(0);
+                        let last = ticks.last().map(|t| t.sqrt_price).unwrap_or(0);
+                        let (q_before, q_after) = tick_quote_compare(&state, &ticks);
+                        inject_ticks(&mut state, ticks);
+                        tracing::info!(
+                            pool = %state.id,
+                            cur_sqrt = clmm_sqrt(&state),
+                            ticks = n,
+                            first_sqrt = first,
+                            last_sqrt = last,
+                            q_before,
+                            q_after,
+                            crosses = (q_before != q_after),
+                            "cetus ticks loaded"
+                        );
+                        Some((state, lref, liq))
+                    }
+                    // Drop the pool (no empty-tick fallback): it will be retried next refresh.
+                    Ok(_) => {
+                        tracing::warn!(pool = %state.id, "cetus pool DROPPED: 0 ticks loaded");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(pool = %state.id, "cetus pool DROPPED: tick load failed: {e}");
+                        None
                     }
                 }
-                (state, lref, liq)
             })
             .buffer_unordered(6)
-            .collect::<Vec<_>>()
+            .collect::<Vec<Option<_>>>()
             .await
+            .into_iter()
+            .flatten()
+            .collect()
     } else {
         kept.into_iter().map(|(s, l, q, _)| (s, l, q)).collect()
     };

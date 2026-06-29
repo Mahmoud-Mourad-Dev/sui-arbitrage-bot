@@ -185,6 +185,86 @@ mod tests {
         assert_eq!(tb.liquidity_net, 5000);
     }
 
+    /// End-to-end verification against a REAL mainnet Cetus pool. Ignored in CI (hits the
+    /// public fullnode); run with:
+    ///   `cargo test --features live -- --ignored verify_ticks_match_chain --nocapture`
+    ///
+    /// Proves, on real data: (a) every initialized tick is loaded (loaded == independently
+    /// enumerated count ⇒ no skips, complete pagination), (b) no duplicate node ids, (c) ticks
+    /// strictly ascending + unique sqrt_price, and (d) the strongest invariant — across ALL
+    /// ticks `Σ liquidity_net == 0` (CLMM positions add at the lower tick and remove at the
+    /// upper). A wrong sign (i128), a skipped/duplicated tick, or truncation would break (d).
+    #[tokio::test]
+    #[ignore = "hits mainnet RPC"]
+    async fn verify_ticks_match_chain() {
+        use std::collections::HashSet;
+        use sui_sdk::SuiClientBuilder;
+        const POOL: &str = "0xc8d7a1503dc2f9f5b05449a87d8733593e2f0f3e7bffd90541252782e4d2ca20";
+        const CAP: usize = 5000;
+
+        let client = SuiClientBuilder::default()
+            .build("https://fullnode.mainnet.sui.io:443")
+            .await
+            .unwrap();
+        let obj = client
+            .read_api()
+            .get_object_with_options(
+                POOL.parse().unwrap(),
+                SuiObjectDataOptions::new().with_content().with_type(),
+            )
+            .await
+            .unwrap();
+        let sk = skiplist_id(&obj).expect("skiplist id from pool content");
+
+        // Independently enumerate every node id (detect dups + complete pagination).
+        let mut ids = HashSet::new();
+        let mut dups = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = client
+                .read_api()
+                .get_dynamic_fields(sk, cursor, Some(50))
+                .await
+                .unwrap();
+            for info in &page.data {
+                if !ids.insert(info.object_id) {
+                    dups += 1;
+                }
+            }
+            if !page.has_next_page || ids.len() >= CAP {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(dups, 0, "duplicate skip-list node ids in pagination");
+        let n = ids.len();
+
+        let ticks = load(&client, sk, CAP).await.unwrap();
+        assert_eq!(
+            ticks.len(),
+            n,
+            "loaded {} != enumerated {n} (skip/decode failure)",
+            ticks.len()
+        );
+        for w in ticks.windows(2) {
+            assert!(
+                w[0].sqrt_price < w[1].sqrt_price,
+                "ticks not strictly ascending / duplicate sqrt_price"
+            );
+        }
+        let pos = ticks.iter().filter(|t| t.liquidity_net > 0).count();
+        let neg = ticks.iter().filter(|t| t.liquidity_net < 0).count();
+        let sum: i128 = ticks.iter().map(|t| t.liquidity_net).sum();
+        println!(
+            "pool {POOL}: ticks={n}, +net={pos}, -net={neg}, Σliquidity_net={sum} (capped={})",
+            n >= CAP
+        );
+        assert!(pos > 0 && neg > 0, "expected both signs of liquidity_net");
+        if n < CAP {
+            assert_eq!(sum, 0, "Σ liquidity_net across all ticks must be 0");
+        }
+    }
+
     #[test]
     fn decode_tick_missing_fields_is_none() {
         assert!(decode_tick(&json!({ "sqrt_price": "1" })).is_none()); // no liquidity_net
