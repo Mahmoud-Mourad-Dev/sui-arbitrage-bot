@@ -213,6 +213,12 @@ pub fn quote_exact_in(state: &ClmmState, amount_in: u64, a_to_b: bool) -> Option
     let mut liquidity = state.liquidity;
     let mut remaining = amount_in as u128;
     let mut out: u128 = 0;
+    // When real initialized ticks are loaded, they delimit our KNOWN liquidity. Beyond the
+    // last loaded tick we have no data, so we must not invent liquidity out to the price
+    // bound (that over-quotes and then aborts on-chain at Cetus `compute_swap_result`). A
+    // pool with no ticks is the single-range V2-equivalent model (Turbos) and keeps the
+    // extend-to-bound behavior.
+    let has_real_ticks = !state.ticks.is_empty();
 
     // Boundaries we may cross, in travel order.
     let mut boundaries: Vec<TickBoundary> = if a_to_b {
@@ -239,11 +245,15 @@ pub fn quote_exact_in(state: &ClmmState, amount_in: u64, a_to_b: bool) -> Option
     let mut iter = boundaries.into_iter();
     while remaining > 0 {
         let boundary = iter.next();
-        let target = boundary.map(|t| t.sqrt_price).unwrap_or(if a_to_b {
-            MIN_SQRT_PRICE
-        } else {
-            MAX_SQRT_PRICE
-        });
+        let target = match boundary {
+            Some(t) => t.sqrt_price,
+            // Ran past the last loaded tick with input remaining: with real ticks this is
+            // beyond known depth — stop (the end check then returns None). Single-range
+            // pools extend to the price bound (the V2-equivalent model).
+            None if has_real_ticks => break,
+            None if a_to_b => MIN_SQRT_PRICE,
+            None => MAX_SQRT_PRICE,
+        };
 
         let (sqrt_next, amount_in_step, amount_out_step, fee) = compute_swap_step(
             sqrt_price,
@@ -273,6 +283,13 @@ pub fn quote_exact_in(state: &ClmmState, amount_in: u64, a_to_b: bool) -> Option
         }
     }
 
+    // Depth-aware refusal: a tick-loaded pool must consume the FULL input within known
+    // liquidity. If input remains (ran past the loaded ticks, or liquidity hit zero), this
+    // size exceeds our executable depth and would abort on-chain — emit no quote rather than
+    // an over-quote, so the sizer only proposes executable sizes.
+    if has_real_ticks && remaining > 0 {
+        return None;
+    }
     u64::try_from(out).ok()
 }
 
@@ -363,27 +380,58 @@ mod tests {
         let l0: u128 = 1_000_000_000_000_000;
         // A downward (a_to_b) swap; just below current price, liquidity drops to 1/10.
         // liquidity_net is the change crossing UP, so to drop L when going DOWN we
-        // set a positive net at that boundary (going down subtracts it).
-        let boundary = TickBoundary {
+        // set a positive net at that boundary (going down subtracts it). A second, far-down
+        // tick keeps the swap WITHIN loaded depth (so the depth-aware guard doesn't refuse).
+        let cliff = TickBoundary {
             sqrt_price: Q64 - (Q64 / 1000), // slightly below current
             liquidity_net: (l0 - l0 / 10) as i128,
+        };
+        let deep = TickBoundary {
+            sqrt_price: Q64 / 2, // far below — ample room to absorb the input
+            liquidity_net: -((l0 / 10) as i128),
         };
         let with_cliff = ClmmState {
             sqrt_price: Q64,
             liquidity: l0,
             fee_pips: 3000,
-            ticks: vec![boundary],
+            ticks: vec![cliff, deep],
         };
         let no_cliff = single_range(Q64, l0, 3000);
 
-        let amount = 50_000_000_000_000u64; // large enough to cross the boundary
-        let out_cliff = quote_exact_in(&with_cliff, amount, true).unwrap();
+        let amount = 50_000_000_000_000u64; // crosses the cliff, stays above the deep tick
+        let out_cliff = quote_exact_in(&with_cliff, amount, true).expect("within loaded depth");
         let out_flat = quote_exact_in(&no_cliff, amount, true).unwrap();
         // Same nominal current price/liquidity, but the liquidity cliff yields less.
         assert!(
             out_cliff < out_flat,
             "cliff {out_cliff} should be < flat {out_flat}"
         );
+    }
+
+    /// Depth-aware sizing: a tick-loaded pool refuses a size that would run past the last
+    /// loaded tick (no fabricated liquidity → no on-chain `compute_swap_result` over-quote),
+    /// while a single-range (no-tick) pool still quotes it under the V2-equivalent model.
+    #[test]
+    fn depth_aware_refuses_size_beyond_loaded_ticks() {
+        let l0: u128 = 1_000_000_000_000_000;
+        let cliff = TickBoundary {
+            sqrt_price: Q64 - (Q64 / 1000),
+            liquidity_net: (l0 - l0 / 10) as i128,
+        };
+        let ticked = ClmmState {
+            sqrt_price: Q64,
+            liquidity: l0,
+            fee_pips: 3000,
+            ticks: vec![cliff], // only one loaded tick
+        };
+        let huge = 50_000_000_000_000u64; // runs past the single loaded tick
+        assert_eq!(
+            quote_exact_in(&ticked, huge, true),
+            None,
+            "must refuse a size beyond loaded depth instead of over-quoting"
+        );
+        // The same input on a no-tick (single-range) pool still quotes (Turbos model intact).
+        assert!(quote_exact_in(&single_range(Q64, l0, 3000), huge, true).is_some());
     }
 
     /// Quantifies the audit's core claim: using V2 on a pool's *balances* when the
