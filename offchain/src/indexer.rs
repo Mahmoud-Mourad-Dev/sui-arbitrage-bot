@@ -34,13 +34,29 @@ use crate::quoter::LivePoolRef;
 use crate::types::{Dex, PoolKind, PoolState};
 use crate::ws::{self, LiveRegistry};
 
-/// Per-pool cache of decoded Cetus ticks (pool id → windowed ticks). Populated on the
-/// discovery cycle and reused on the fast refresh so tick reads are infrequent, not per-tick.
+/// Per-pool cache of decoded ticks (pool id → windowed ticks). Populated on the discovery
+/// cycle and reused on the fast refresh so tick reads are infrequent, not per-tick.
 type TickCache = Arc<RwLock<HashMap<String, Vec<TickBoundary>>>>;
 
-/// A kept pool pending tick injection: state, live ref, liquidity, and (for Cetus with tick
-/// loading on) its `(tick-SkipList UID, current score)` for windowed loading.
-type KeptPool = (PoolState, LivePoolRef, u128, Option<(ObjectID, u64)>);
+/// Where to read a pool's initialized ticks (when tick loading is on). Cetus reads a separate
+/// SkipList keyed by score; Turbos reads dynamic fields on the pool itself, keyed by tick index
+/// (sqrt_price derived from the pool's current price).
+#[derive(Clone, Copy)]
+enum TickSrc {
+    Cetus {
+        skiplist: ObjectID,
+        score: u64,
+    },
+    Turbos {
+        pool: ObjectID,
+        sqrt: u128,
+        tick: i32,
+    },
+}
+
+/// A kept pool pending tick injection: state, live ref, liquidity, and (when tick loading is
+/// on) its tick source for windowed loading.
+type KeptPool = (PoolState, LivePoolRef, u128, Option<TickSrc>);
 
 /// The pool-creation event that announces new pools for a DEX.
 pub struct EventSpec {
@@ -190,6 +206,23 @@ fn inject_ticks(state: &mut PoolState, ticks: Vec<crate::clmm::TickBoundary>) {
     }
 }
 
+/// Load a pool's windowed ticks from the correct on-chain source (Cetus SkipList vs Turbos
+/// pool dynamic fields). Returns the engine's `TickBoundary`s sorted by `sqrt_price`.
+async fn load_ticks_for(
+    client: &SuiClient,
+    src: TickSrc,
+    window: usize,
+) -> Result<Vec<TickBoundary>> {
+    match src {
+        TickSrc::Cetus { skiplist, score } => {
+            crate::cetus_ticks::load_window(client, skiplist, score, window).await
+        }
+        TickSrc::Turbos { pool, sqrt, tick } => {
+            crate::turbos_ticks::load_window(client, pool, sqrt, tick, window).await
+        }
+    }
+}
+
 /// Current sqrt-price of a CLMM pool (0 for V2), for diagnostics.
 fn clmm_sqrt(state: &PoolState) -> u128 {
     match &state.kind {
@@ -327,9 +360,22 @@ async fn sync_pools(
                                 && adapter.normalize(&state)
                             {
                                 let skid =
-                                    if config.indexer_load_ticks && adapter.dex() == Dex::Cetus {
-                                        crate::cetus_ticks::skiplist_id(obj)
-                                            .zip(crate::cetus_ticks::current_score(obj))
+                                    if config.indexer_load_ticks {
+                                        match adapter.dex() {
+                                            Dex::Cetus => crate::cetus_ticks::skiplist_id(obj)
+                                                .zip(crate::cetus_ticks::current_score(obj))
+                                                .map(|(skiplist, score)| TickSrc::Cetus {
+                                                    skiplist,
+                                                    score,
+                                                }),
+                                            Dex::Turbos => crate::turbos_ticks::current_tick(obj)
+                                                .map(|tick| TickSrc::Turbos {
+                                                    pool: lref.pool_id,
+                                                    sqrt: clmm_sqrt(&state),
+                                                    tick,
+                                                }),
+                                            Dex::AmmV2 => None,
+                                        }
                                     } else {
                                         None
                                     };
@@ -376,8 +422,8 @@ async fn sync_pools(
             .map(|(mut state, lref, liq, skid)| {
                 let tick_cache = Arc::clone(tick_cache);
                 async move {
-                    let Some((sk, score)) = skid else {
-                        return Some((state, lref, liq)); // non-Cetus (e.g. Turbos): unchanged
+                    let Some(src) = skid else {
+                        return Some((state, lref, liq)); // V2 / no tick source: unchanged
                     };
                     let cached = tick_cache.read().expect("tick cache poisoned").get(&state.id).cloned();
 
@@ -389,10 +435,10 @@ async fn sync_pools(
                         }
                     }
 
-                    // (Re)fetch the window, with exponential backoff on transient errors
-                    // (chiefly RPC `429` during the bootstrap burst). Per-pool jitter desyncs
-                    // retries so they don't all hammer the RPC on the same beat.
-                    let mut res = crate::cetus_ticks::load_window(client, sk, score, window).await;
+                    // (Re)fetch the window (Cetus or Turbos), with exponential backoff on
+                    // transient RPC errors (chiefly `429` during the bootstrap burst). Per-pool
+                    // jitter desyncs retries so they don't all hammer the RPC on the same beat.
+                    let mut res = load_ticks_for(client, src, window).await;
                     let jitter = state.id.bytes().map(u64::from).sum::<u64>() % 200;
                     let mut delay = 250u64;
                     for _ in 0..3 {
@@ -400,7 +446,7 @@ async fn sync_pools(
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
-                        res = crate::cetus_ticks::load_window(client, sk, score, window).await;
+                        res = load_ticks_for(client, src, window).await;
                         delay *= 3;
                     }
                     match res {
@@ -411,11 +457,12 @@ async fn sync_pools(
                                 .write()
                                 .expect("tick cache poisoned")
                                 .insert(state.id.clone(), ticks.clone());
+                            let dex = state.dex;
                             inject_ticks(&mut state, ticks);
                             tracing::info!(
-                                pool = %state.id, cur_sqrt = clmm_sqrt(&state), ticks = n,
+                                pool = %state.id, dex = ?dex, cur_sqrt = clmm_sqrt(&state), ticks = n,
                                 q_before, q_after, crosses = (q_before != q_after),
-                                "cetus ticks loaded"
+                                "ticks loaded"
                             );
                             Some((state, lref, liq))
                         }
@@ -423,12 +470,12 @@ async fn sync_pools(
                         other => {
                             if let Some(ticks) = cached {
                                 inject_ticks(&mut state, ticks);
-                                tracing::debug!(pool = %state.id, "cetus ticks: reused stale cache (refetch failed)");
+                                tracing::debug!(pool = %state.id, "ticks: reused stale cache (refetch failed)");
                                 Some((state, lref, liq))
                             } else {
                                 match other {
-                                    Err(e) => tracing::warn!(pool = %state.id, "cetus pool DROPPED: tick load failed: {e}"),
-                                    _ => tracing::warn!(pool = %state.id, "cetus pool DROPPED: 0 ticks"),
+                                    Err(e) => tracing::warn!(pool = %state.id, dex = ?state.dex, "pool DROPPED: tick load failed: {e}"),
+                                    _ => tracing::warn!(pool = %state.id, dex = ?state.dex, "pool DROPPED: 0 ticks"),
                                 }
                                 None
                             }
