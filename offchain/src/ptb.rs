@@ -486,50 +486,11 @@ mod live {
             base.clone(),
             vec![loan, min_profit_arg],
         ));
-        let mut coin = nested(begin, 0);
+        let coin = nested(begin, 0);
         let arcpt = nested(begin, 1);
 
-        // 3. per-hop swaps, threading the coin through
-        for (step, hop) in plan
-            .iter()
-            .filter(|s| matches!(s, PtbStep::Swap { .. }))
-            .zip(inputs.hops.iter())
-        {
-            let PtbStep::Swap {
-                module, function, ..
-            } = step
-            else {
-                bail!("plan/hop mismatch")
-            };
-            let pool_arg = ptb.obj(hop.pool)?;
-            let min_out_arg = ptb.pure(hop.min_out)?;
-            // Assemble args in the exact order each adapter expects (ctx is implicit).
-            let args = match hop.dex {
-                Dex::AmmV2 => vec![pool_arg, coin, min_out_arg],
-                Dex::Cetus => {
-                    let config =
-                        ptb.obj(hop.cetus_config.context("cetus hop missing GlobalConfig")?)?;
-                    let clock = ptb.obj(hop.clock.context("cetus hop missing Clock")?)?;
-                    vec![config, pool_arg, coin, min_out_arg, clock]
-                }
-                Dex::Turbos => {
-                    let clock = ptb.obj(hop.clock.context("turbos hop missing Clock")?)?;
-                    let versioned = ptb.obj(
-                        hop.turbos_versioned
-                            .context("turbos hop missing Versioned")?,
-                    )?;
-                    vec![pool_arg, coin, min_out_arg, clock, versioned]
-                }
-            };
-            let swap = ptb.command(Command::move_call(
-                inputs.package,
-                id(module)?,
-                id(function)?,
-                hop.type_args.clone(),
-                args,
-            ));
-            coin = swap; // single-return (Coin<Out>)
-        }
+        // 3. per-hop swaps, threading the coin through (shared with the owned path).
+        let coin = lower_swaps(&mut ptb, inputs.package, plan, &inputs.hops, coin)?;
 
         // 4. executor::settle_and_return<T>(receipt, coin) -> proceeds (PROFIT GATE)
         let proceeds = ptb.command(Command::move_call(
@@ -585,6 +546,109 @@ mod live {
             Argument::Result(i) => Argument::NestedResult(i, ix),
             other => other,
         }
+    }
+
+    /// Thread the input coin through every `PtbStep::Swap`, emitting the adapter move call
+    /// per hop in the exact arg order each venue expects. Shared by the flash and owned
+    /// builders so the swaps are byte-for-byte identical between modes.
+    fn lower_swaps(
+        ptb: &mut ProgrammableTransactionBuilder,
+        package: ObjectID,
+        plan: &[PtbStep],
+        hops: &[ResolvedHop],
+        mut coin: Argument,
+    ) -> Result<Argument> {
+        for (step, hop) in plan
+            .iter()
+            .filter(|s| matches!(s, PtbStep::Swap { .. }))
+            .zip(hops.iter())
+        {
+            let PtbStep::Swap {
+                module, function, ..
+            } = step
+            else {
+                bail!("plan/hop mismatch")
+            };
+            let pool_arg = ptb.obj(hop.pool)?;
+            let min_out_arg = ptb.pure(hop.min_out)?;
+            let args = match hop.dex {
+                Dex::AmmV2 => vec![pool_arg, coin, min_out_arg],
+                Dex::Cetus => {
+                    let config =
+                        ptb.obj(hop.cetus_config.context("cetus hop missing GlobalConfig")?)?;
+                    let clock = ptb.obj(hop.clock.context("cetus hop missing Clock")?)?;
+                    vec![config, pool_arg, coin, min_out_arg, clock]
+                }
+                Dex::Turbos => {
+                    let clock = ptb.obj(hop.clock.context("turbos hop missing Clock")?)?;
+                    let versioned = ptb.obj(
+                        hop.turbos_versioned
+                            .context("turbos hop missing Versioned")?,
+                    )?;
+                    vec![pool_arg, coin, min_out_arg, clock, versioned]
+                }
+            };
+            let swap = ptb.command(Command::move_call(
+                package,
+                id(module)?,
+                id(function)?,
+                hop.type_args.clone(),
+                args,
+            ));
+            coin = swap; // single-return (Coin<Out>)
+        }
+        Ok(coin)
+    }
+
+    /// Inputs for the owned-capital builder: no lender/flash fields — the input coin is split
+    /// from the sender's own SUI (the gas coin), and `executor::settle` returns it to the
+    /// sender (enforcing the profit gate). Same `ResolvedHop`s as the flash path.
+    pub struct OwnedInputs {
+        pub package: ObjectID,
+        pub base_type: TypeTag,
+        pub amount: u64,
+        pub min_profit: u64,
+        pub hops: Vec<ResolvedHop>,
+    }
+
+    /// Assemble the owned-capital PTB: split input off the gas coin → `executor::begin` →
+    /// swaps → `executor::settle` (profit gate + transfer to the sender). No flash
+    /// borrow/repay, no Scallop. Capital at risk = gas only (a bad fill reverts at `settle`).
+    pub fn build_owned(plan: &[PtbStep], inputs: OwnedInputs) -> Result<ProgrammableTransaction> {
+        let mut ptb = ProgrammableTransactionBuilder::new();
+        let base = vec![inputs.base_type.clone()];
+
+        // 1. Split the input amount off the gas coin (SUI is both gas and the traded asset).
+        let amount_arg = ptb.pure(inputs.amount)?;
+        let split = ptb.command(Command::SplitCoins(Argument::GasCoin, vec![amount_arg]));
+        let input = nested(split, 0);
+
+        // 2. executor::begin<T>(input, min_profit) -> (coin, ArbReceipt). Records initiator =
+        //    tx sender + initial_amount = input value (the profit baseline).
+        let min_profit_arg = ptb.pure(inputs.min_profit)?;
+        let begin = ptb.command(Command::move_call(
+            inputs.package,
+            id("executor")?,
+            id("begin")?,
+            base.clone(),
+            vec![input, min_profit_arg],
+        ));
+        let coin = nested(begin, 0);
+        let arcpt = nested(begin, 1);
+
+        // 3. swaps (identical lowering to the flash path).
+        let coin = lower_swaps(&mut ptb, inputs.package, plan, &inputs.hops, coin)?;
+
+        // 4. executor::settle<T>(receipt, coin): asserts final >= initial + min_profit, then
+        //    transfers the output back to the sender. No flash repay.
+        ptb.command(Command::move_call(
+            inputs.package,
+            id("executor")?,
+            id("settle")?,
+            base,
+            vec![arcpt, coin],
+        ));
+        Ok(ptb.finish())
     }
 
     /// Everything the live liquidation builder needs, resolved fresh against chain.
@@ -961,4 +1025,6 @@ fn adapter_module(dex: Dex) -> &'static str {
 }
 
 #[cfg(feature = "live")]
-pub use live::{build, build_liquidation, BuildInputs, LiquidationInputs, ResolvedHop};
+pub use live::{
+    build, build_liquidation, build_owned, BuildInputs, LiquidationInputs, OwnedInputs, ResolvedHop,
+};

@@ -275,18 +275,39 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
                 "candidate — re-quoting + dry-running"
             );
             let _t = arb_scanner::metrics::stage_timer(arb_scanner::metrics::Stage::Executor);
-            if let Err(e) = executor::try_execute(
-                &client,
-                &objcache,
-                &config,
-                &opp,
-                &registry,
-                &mut guard,
-                base_decimals,
-                base_price_usd,
-            )
-            .await
-            {
+            // Owned-capital mode (arb only): re-size the route from wallet SUI and dry-run a
+            // size ladder; flash mode (and liquidations) keep the existing path.
+            let owned = config.execution_mode == arb_scanner::config::ExecMode::Owned
+                && opp.kind == arb_scanner::scanner::OppKind::Arb;
+            let result = if owned {
+                executor::try_execute_owned_sized(
+                    &client,
+                    &objcache,
+                    &config,
+                    &opp.route,
+                    &pools,
+                    &registry,
+                    &mut guard,
+                    base_decimals,
+                    base_price_usd,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                executor::try_execute(
+                    &client,
+                    &objcache,
+                    &config,
+                    &opp,
+                    &registry,
+                    &mut guard,
+                    base_decimals,
+                    base_price_usd,
+                )
+                .await
+                .map(|_| ())
+            };
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "execution failed");
             }
         }

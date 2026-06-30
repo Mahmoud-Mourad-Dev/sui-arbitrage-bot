@@ -239,6 +239,15 @@ pub fn simulate_route(pools: &[PoolState], route: &[Hop], input: u64) -> Option<
     simulate(&by_id, route, input)
 }
 
+/// Re-quote a route at `input`, returning the output *after each hop* (same length as
+/// `route`). Used by owned-capital sizing to re-price a route at multiple sizes and to
+/// derive per-hop `min_out` floors. `None` if any hop can't be quoted.
+#[must_use]
+pub fn simulate_route_hops(pools: &[PoolState], route: &[Hop], input: u64) -> Option<Vec<u64>> {
+    let by_id: HashMap<&str, &PoolState> = pools.iter().map(|p| (p.id.as_str(), p)).collect();
+    simulate_collect(&by_id, route, input)
+}
+
 /// Run `input` through every hop with the engine (funnel stage 1). `None` if any
 /// hop can't be quoted.
 fn simulate(by_id: &HashMap<&str, &PoolState>, route: &[Hop], input: u64) -> Option<u64> {

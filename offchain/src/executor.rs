@@ -391,6 +391,324 @@ async fn build_ptb(
     crate::ptb::build(&plan, inputs)
 }
 
+/// Build the OWNED-capital PTB for `opp` at `opp.input_amount`: split input off the gas coin
+/// → `executor::begin` → swaps → `executor::settle` (profit gate + return to sender). No flash
+/// borrow/repay, no Scallop. `floors` are the per-hop `min_out` slippage floors. `min_profit`
+/// is the on-chain settle threshold.
+#[allow(clippy::too_many_arguments)]
+async fn build_owned_ptb(
+    client: &SuiClient,
+    objcache: &ObjRefCache,
+    config: &Config,
+    route: &[crate::scanner::Hop],
+    refs: &[(LivePoolRef, bool)],
+    floors: &[u64],
+    amount: u64,
+    min_profit: u64,
+) -> Result<ProgrammableTransaction> {
+    let base_type: TypeTag = config.base_token.parse()?;
+    let pkg: ObjectID = config.package_id.parse().context("ARB_PACKAGE_ID")?;
+    let clock = clock_arg();
+    let cetus_cfg = objcache
+        .shared_arg(client, &config.cetus_global_config_id, false)
+        .await
+        .ok();
+    let turbos_ver = objcache
+        .shared_arg(client, &config.turbos_versioned_id, false)
+        .await
+        .ok();
+
+    let mut hops = Vec::with_capacity(refs.len());
+    for (i, (lref, a_to_b)) in refs.iter().enumerate() {
+        let pool = ObjectArg::SharedObject {
+            id: lref.pool_id,
+            initial_shared_version: lref.init_shared_version,
+            mutability: SharedObjectMutability::Mutable,
+        };
+        let mut type_args = vec![lref.type_a.clone(), lref.type_b.clone()];
+        if let Some(ft) = &lref.fee_type {
+            type_args.push(ft.clone());
+        }
+        hops.push(crate::ptb::ResolvedHop {
+            dex: lref.dex,
+            a_to_b: *a_to_b,
+            pool,
+            type_args,
+            min_out: floors[i],
+            cetus_config: cetus_cfg,
+            clock: Some(clock),
+            turbos_versioned: turbos_ver,
+        });
+    }
+
+    // The plan describes Begin → swaps → Settle. push_swaps reads each hop's dex + a_to_b to
+    // pick the adapter module/function, so the plan MUST use the real route.
+    let plan_opp = crate::scanner::Opportunity {
+        kind: OppKind::Arb,
+        liquidation: None,
+        route: route.to_vec(),
+        input_amount: amount,
+        output_amount: 0,
+        hop_outputs: vec![0; route.len()],
+        gross_profit: 0,
+        flash_fee: 0,
+        net_profit: 0,
+    };
+    let plan = crate::ptb::owned_arb_plan(&plan_opp, min_profit);
+    let inputs = crate::ptb::OwnedInputs {
+        package: pkg,
+        base_type,
+        amount,
+        min_profit,
+        hops,
+    };
+    crate::ptb::build_owned(&plan, inputs)
+}
+
+/// Gas payment coins whose balances sum to at least `need` (largest-first), so an owned-mode
+/// PTB can split the input off the (smashed) gas coin and still cover gas. Errors if the
+/// wallet can't cover `need`.
+async fn pick_gas_coins_covering(
+    client: &SuiClient,
+    sender: SuiAddress,
+    need: u64,
+) -> Result<Vec<ObjectRef>> {
+    let mut coins = client
+        .coin_read_api()
+        .get_coins(sender, None, None, Some(200))
+        .await?
+        .data;
+    coins.sort_by_key(|c| std::cmp::Reverse(c.balance));
+    let mut picked = Vec::new();
+    let mut sum: u64 = 0;
+    for c in coins {
+        if sum >= need {
+            break;
+        }
+        sum += c.balance;
+        picked.push(c.object_ref());
+    }
+    if sum < need || picked.is_empty() {
+        bail!("wallet SUI {sum} < required {need} (input + gas) for {sender}");
+    }
+    Ok(picked)
+}
+
+/// One size's outcome in the owned-mode sweep (for the report).
+#[derive(Debug, Clone)]
+pub struct OwnedSizeResult {
+    pub size: u64,
+    pub expected_out: u64,
+    pub expected_net: i128,
+    pub dry_success: bool,
+    pub dry_net_base: i128,
+    pub dry_gas: u64,
+    pub note: String,
+}
+
+/// Owned-capital execution with dynamic position sizing. For a fixed `route`, re-quote each
+/// configured size (≤ wallet balance and `max_wallet_capital`), then dry-run the
+/// positive-expected sizes largest-first and pick the largest that succeeds with
+/// `net_base ≥ effective_min_profit`. Submits that one only if `submit_enabled`. Keeps the
+/// dry-run gate, slippage floors, risk guard, daily-loss cap, and kill-switch. Returns the
+/// per-size results (caller logs/aggregates the report).
+#[allow(clippy::too_many_arguments)]
+pub async fn try_execute_owned_sized(
+    client: &SuiClient,
+    objcache: &ObjRefCache,
+    config: &Config,
+    route: &[crate::scanner::Hop],
+    pools: &[crate::types::PoolState],
+    registry: &LiveRegistry,
+    guard: &mut RiskGuard,
+    base_decimals: u32,
+    price_usd: f64,
+) -> Result<Vec<OwnedSizeResult>> {
+    let sender: SuiAddress = config
+        .sender_address
+        .parse()
+        .context("ARB_SENDER_ADDRESS")?;
+    let base_type: TypeTag = config.base_token.parse().context("base token type")?;
+    let effective_min = config.effective_min_profit_mist();
+
+    // Resolve hop refs once (route is fixed across sizes).
+    let refs: Vec<(LivePoolRef, bool)> = {
+        let reg = registry.read().expect("registry poisoned");
+        route
+            .iter()
+            .map(|h| {
+                reg.get(&h.pool_id)
+                    .cloned()
+                    .map(|r| (r, h.a_to_b))
+                    .ok_or_else(|| anyhow!("no live ref for pool {}", h.pool_id))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    // Wallet balance → size cap. Leave the gas budget aside (input is split off the gas coin).
+    let balance = client
+        .coin_read_api()
+        .get_balance(sender, None)
+        .await?
+        .total_balance;
+    let cap = (balance.saturating_sub(u128::from(config.gas_budget)) as u64)
+        .min(config.max_wallet_capital);
+    tracing::info!(
+        wallet_mist = balance as u64,
+        cap_mist = cap,
+        effective_min_profit = effective_min,
+        sizes = ?config.owned_sizes,
+        "owned-mode sweep: wallet balance detected"
+    );
+
+    // Stage 1: cheap re-quote per size; keep sizes within cap with positive expected net.
+    let mut sized: Vec<OwnedSizeResult> = Vec::new();
+    for &size in &config.owned_sizes {
+        if size > cap {
+            sized.push(OwnedSizeResult {
+                size,
+                expected_out: 0,
+                expected_net: 0,
+                dry_success: false,
+                dry_net_base: 0,
+                dry_gas: 0,
+                note: "skipped: exceeds wallet cap".into(),
+            });
+            continue;
+        }
+        match crate::scanner::simulate_route_hops(pools, route, size) {
+            Some(hops) => {
+                let out = *hops.last().unwrap_or(&0);
+                sized.push(OwnedSizeResult {
+                    size,
+                    expected_out: out,
+                    expected_net: i128::from(out) - i128::from(size),
+                    dry_success: false,
+                    dry_net_base: 0,
+                    dry_gas: 0,
+                    note: String::new(),
+                });
+            }
+            None => sized.push(OwnedSizeResult {
+                size,
+                expected_out: 0,
+                expected_net: 0,
+                dry_success: false,
+                dry_net_base: 0,
+                dry_gas: 0,
+                note: "quote failed".into(),
+            }),
+        }
+    }
+
+    // Stage 2: dry-run positive-expected sizes LARGEST-first; first success with
+    // net_base >= effective_min wins.
+    let gas_price = client.read_api().get_reference_gas_price().await?;
+    let mut winner: Option<(u64, TransactionData, i128)> = None;
+    let mut order: Vec<usize> = (0..sized.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sized[i].size));
+    for i in order {
+        if winner.is_some() || sized[i].expected_net <= 0 || sized[i].expected_out == 0 {
+            continue;
+        }
+        let size = sized[i].size;
+        let hop_outs = match crate::scanner::simulate_route_hops(pools, route, size) {
+            Some(h) => h,
+            None => continue,
+        };
+        let floors: Vec<u64> = hop_outs
+            .iter()
+            .map(|o| apply_slippage_floor(*o, config.per_hop_slippage_bps))
+            .collect();
+        let pt = match build_owned_ptb(
+            client,
+            objcache,
+            config,
+            route,
+            &refs,
+            &floors,
+            size,
+            effective_min,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                sized[i].note = format!("ptb build failed: {e}");
+                continue;
+            }
+        };
+        let gas_coins =
+            match pick_gas_coins_covering(client, sender, size + config.gas_budget).await {
+                Ok(c) => c,
+                Err(e) => {
+                    sized[i].note = format!("gas coins: {e}");
+                    continue;
+                }
+            };
+        let tx =
+            TransactionData::new_programmable(sender, gas_coins, pt, config.gas_budget, gas_price);
+        let dry = dry_run(client, &tx, &base_type, sender).await?;
+        sized[i].dry_success = dry.success;
+        sized[i].dry_net_base = dry.net_base;
+        sized[i].dry_gas = dry.gas_used;
+        if !dry.success {
+            sized[i].note = "dry-run reverted".into();
+        } else if dry.net_base < i128::from(effective_min) {
+            sized[i].note = format!("below min_profit (net {} < {effective_min})", dry.net_base);
+        } else {
+            sized[i].note = "dry-run OK, profitable".into();
+            winner = Some((size, tx, dry.net_base));
+        }
+        tracing::info!(
+            size,
+            expected_out = sized[i].expected_out,
+            dry_success = sized[i].dry_success,
+            dry_net_base = sized[i].dry_net_base,
+            dry_gas = sized[i].dry_gas,
+            note = %sized[i].note,
+            "owned-mode size attempt"
+        );
+    }
+
+    // Stage 3: submit the winner (only if enabled + risk allows).
+    if let Some((size, tx, net_base)) = winner {
+        let net_usd = mist_to_usd(net_base.max(0) as u64, base_decimals, price_usd);
+        let pool_ids: Vec<&str> = route.iter().map(|h| h.pool_id.as_str()).collect();
+        match guard.should_submit(net_usd, &pool_ids) {
+            Decision::Skip(reason) => {
+                tracing::warn!(reason, size, "owned-mode: risk guard skip");
+            }
+            Decision::Submit => {
+                if config.submit_enabled {
+                    tracing::warn!(size, net_base, "owned-mode: SUBMITTING winning size");
+                    submit(
+                        client,
+                        config,
+                        tx,
+                        &base_type,
+                        sender,
+                        guard,
+                        net_usd,
+                        base_decimals,
+                        price_usd,
+                    )
+                    .await?;
+                } else {
+                    tracing::info!(
+                        size,
+                        net_base,
+                        "owned-mode: DRY-RUN ONLY winner (submit_enabled=false)"
+                    );
+                }
+            }
+        }
+    } else {
+        tracing::info!("owned-mode: no size produced a profitable dry-run");
+    }
+    Ok(sized)
+}
+
 /// Assemble + build the Scallop liquidation PTB (VERIFIED Pyth accumulator refresh →
 /// flash borrow → liquidate → swap-back → settle_and_return → repay). Object ids come from
 /// config (Wormhole/Pyth defaults are the verified mainnet ids); the Hermes accumulator is

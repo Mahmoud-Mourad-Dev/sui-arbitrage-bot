@@ -129,6 +129,28 @@ pub struct Config {
     pub indexer_load_ticks: bool,
     /// Max initialized ticks to load per pool when `indexer_load_ticks` is on.
     pub indexer_max_ticks: usize,
+    /// Execution mode: `flash` (borrow → swaps → repay) or `owned` (trade from wallet SUI,
+    /// no flash loan). Default `flash` (the existing, safe path). See [`ExecMode`].
+    pub execution_mode: ExecMode,
+    /// Owned-mode candidate input sizes (MIST), tried largest-first; sizes exceeding the
+    /// wallet balance (or `max_wallet_capital`) are skipped.
+    pub owned_sizes: Vec<u64>,
+    /// Owned-mode hard cap on input size (MIST), independent of wallet balance.
+    pub max_wallet_capital: u64,
+    /// Optional minimum net profit expressed in USD; converted to MIST via `sui_price_usd`.
+    /// When set, overrides `min_profit` for the net-profit gate. `None` → use `min_profit`.
+    pub min_profit_usd: Option<f64>,
+    /// SUI/USD price used only to convert `min_profit_usd` → MIST (no live oracle here).
+    pub sui_price_usd: f64,
+}
+
+/// How the executor funds a trade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecMode {
+    /// Flash-loan funded (borrow → swaps → repay). The existing path.
+    Flash,
+    /// Funded from the sender's own SUI balance (split → swaps → settle). No flash loan.
+    Owned,
 }
 
 impl Config {
@@ -218,7 +240,31 @@ impl Config {
             indexer_quote_tokens: env_list("ARB_INDEXER_QUOTE_TOKENS"),
             indexer_load_ticks: env_parse("ARB_INDEXER_LOAD_TICKS", false)?,
             indexer_max_ticks: env_parse("ARB_INDEXER_MAX_TICKS", 512)?,
+            execution_mode: match env_or("ARB_EXECUTION_MODE", "flash")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "owned" => ExecMode::Owned,
+                _ => ExecMode::Flash, // default safe
+            },
+            owned_sizes: env_sui_sizes(),
+            max_wallet_capital: env_parse("ARB_MAX_WALLET_CAPITAL", 200_000_000_000u64)?,
+            min_profit_usd: std::env::var("ARB_MIN_PROFIT_USD")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            sui_price_usd: env_parse("ARB_SUI_PRICE_USD", 3.0)?,
         })
+    }
+
+    /// Effective net-profit threshold in MIST: `min_profit_usd / sui_price_usd` (×1e9) when
+    /// `min_profit_usd` is set and `sui_price_usd > 0`, else `min_profit`.
+    #[must_use]
+    pub fn effective_min_profit_mist(&self) -> u64 {
+        match self.min_profit_usd {
+            Some(usd) if self.sui_price_usd > 0.0 => (usd / self.sui_price_usd * 1e9) as u64,
+            _ => self.min_profit,
+        }
     }
 
     /// The Pyth `PriceInfoObject` id configured for `coin_type`, from
@@ -256,6 +302,26 @@ fn env_list(key: &str) -> Vec<String> {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Owned-mode size ladder. `ARB_OWNED_SIZES` = comma-separated **SUI** values; otherwise the
+/// default 5..200 ladder. Returns MIST, sorted ascending.
+fn env_sui_sizes() -> Vec<u64> {
+    let mut sizes: Vec<u64> = match env::var("ARB_OWNED_SIZES") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .map(|sui| (sui * 1e9) as u64)
+            .filter(|m| *m > 0)
+            .collect(),
+        Err(_) => [5, 10, 20, 30, 50, 75, 100, 150, 200]
+            .iter()
+            .map(|s| s * 1_000_000_000u64)
+            .collect(),
+    };
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
 }
 
 fn env_parse<T: FromStr>(key: &str, default: T) -> Result<T>
