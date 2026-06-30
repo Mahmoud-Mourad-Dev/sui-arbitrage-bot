@@ -24,3 +24,4 @@ validation/cetus/mv_pools.json
 
 # OS files
 .DS_Store
+runs/
