@@ -88,6 +88,26 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
     use arb_scanner::{executor, ingest, ws};
     use sui_sdk::SuiClientBuilder;
 
+    // Validate safety-critical invariants before spawning background tasks or
+    // touching the signing path. Owned mode currently splits the SUI gas coin and
+    // therefore cannot honestly support an arbitrary configured base token.
+    if !config.sui_price_usd.is_finite() || config.sui_price_usd <= 0.0 {
+        anyhow::bail!("ARB_SUI_PRICE_USD must be finite and > 0");
+    }
+    if config.max_quote_age_ms == 0 {
+        anyhow::bail!("ARB_MAX_QUOTE_AGE_MS must be > 0");
+    }
+    if config.execution_mode == arb_scanner::config::ExecMode::Owned
+        && config.base_token != "0x2::sui::SUI"
+    {
+        anyhow::bail!("owned execution currently requires ARB_BASE_TOKEN=0x2::sui::SUI");
+    }
+    if config.liq_enabled && config.submit_enabled {
+        anyhow::bail!(
+            "live liquidation submission is disabled until risk accounting is asset-aware"
+        );
+    }
+
     let cache = Arc::new(cache);
     // On-chain object coordinates (pool refs) the quoter/PTB builder need.
     let registry: LiveRegistry = Arc::new(RwLock::new(HashMap::new()));
@@ -99,11 +119,17 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
         config.pool_blacklist.clone(),
     ));
 
-    // Base-token USD valuation for the risk guard. SUI = 9 decimals; the price is a
-    // live input — until a price feed is wired (Phase 6), pass 1.0 so the guard gates
-    // in base units rather than USD.
+    // Base-token USD valuation for the risk guard. SUI = 9 decimals. Until a live
+    // oracle is wired, use the explicitly configured operator price consistently
+    // (the owned-mode USD min-profit conversion uses the same value).
     let base_decimals: u32 = 9;
-    let base_price_usd: f64 = 1.0;
+    let base_price_usd: f64 = config.sui_price_usd;
+
+    // Fail closed on contradictory funding configuration. `execution_mode=flash`
+    // must never silently borrow when the operator disabled flash loans.
+    if config.execution_mode == arb_scanner::config::ExecMode::Flash && !config.flash_enabled {
+        anyhow::bail!("ARB_EXECUTION_MODE=flash requires ARB_FLASH_ENABLED=true");
+    }
 
     // Shared, long-lived RPC client for the executor hot path — built ONCE (no
     // per-candidate rebuild), plus a shared-object-ref cache so the PTB builder never
@@ -225,14 +251,18 @@ async fn run_live(config: Config, cache: ReserveCache) -> Result<()> {
         ticks += 1;
         let pools = cache.snapshot();
         arb_scanner::metrics::set_cache_size(pools.len());
-        arb_scanner::metrics::set_tracked_pools(config.tracked_pools.len());
+        // In indexer mode the indexer owns this gauge. Overwriting it here with the
+        // (intentionally empty) manual list made the production dashboard report 0.
+        if !config.indexer_enabled {
+            arb_scanner::metrics::set_tracked_pools(config.tracked_pools.len());
+        }
         let params = ScanParams {
             base_token: config.base_token.clone(),
             max_hops: config.max_hops,
             candidate_inputs: config.candidate_inputs.clone(),
             gas_cost: config.gas_cost_estimate,
             flash_fee_bps: config.flash_fee_bps,
-            min_profit: config.min_profit,
+            min_profit: config.effective_min_profit_mist(),
         };
         // Merge every source's opportunities into the one pipeline; execute the best net.
         let mut candidates: Vec<_> = {

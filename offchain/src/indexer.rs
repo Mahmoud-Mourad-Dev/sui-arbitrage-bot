@@ -314,7 +314,7 @@ async fn sync_pools(
     cap: usize,
     tick_cache: &TickCache,
     refetch_ticks: bool,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     use futures_util::stream::{self, StreamExt};
 
     let opts = SuiObjectDataOptions::new()
@@ -324,6 +324,7 @@ async fn sync_pools(
     // 4th field: for a Cetus pool (when tick loading is on), its tick-SkipList UID + the
     // current skip-list score (to center the window). `None` for non-Cetus / loading off.
     let mut kept: Vec<KeptPool> = Vec::new();
+    let mut complete = true;
 
     // Fetch object batches with BOUNDED concurrency so bootstrap (thousands of pools) takes
     // seconds, not minutes — without flooding the RPC. Decode happens after each batch lands.
@@ -387,6 +388,7 @@ async fn sync_pools(
                 }
             }
             Err(e) => {
+                complete = false;
                 metrics::set_rpc_up(false);
                 tracing::warn!(dex = adapter.label(), "indexer batch read failed: {e}");
             }
@@ -506,7 +508,41 @@ async fn sync_pools(
         active.push(id);
     }
     metrics::set_dex_pools(metric_dex(adapter.label()), active.len());
-    active
+    (active, complete)
+}
+
+/// Replace one DEX's active-id set only after a complete refresh. On partial RPC
+/// failure we keep the previous membership so transient 429s cannot silently delete
+/// half the graph. On a complete refresh, evict pools that genuinely left the set.
+fn install_active_set(
+    old: &mut Vec<String>,
+    new: Vec<String>,
+    complete: bool,
+    cache: &Arc<ReserveCache>,
+    registry: &LiveRegistry,
+) {
+    if !complete && !old.is_empty() {
+        tracing::warn!("indexer refresh incomplete; preserving previous active set");
+        return;
+    }
+    let new_ids: std::collections::HashSet<&str> = new.iter().map(String::as_str).collect();
+    let removed: Vec<String> = old
+        .iter()
+        .filter(|id| !new_ids.contains(id.as_str()))
+        .cloned()
+        .collect();
+    if !removed.is_empty() {
+        let mut reg = registry.write().expect("registry poisoned");
+        for id in &removed {
+            cache.remove(id);
+            reg.remove(id);
+        }
+        tracing::info!(
+            removed = removed.len(),
+            "evicted pools no longer in active set"
+        );
+    }
+    *old = new;
 }
 
 /// Run the indexer: bootstrap discovery, then refresh the active set on `indexer_refresh_secs`
@@ -550,7 +586,7 @@ pub async fn run(
             Err(e) => tracing::warn!(dex = a.label(), "discover failed: {e}"),
         }
         if a.quotable() {
-            active[i] = sync_pools(
+            let (new, complete) = sync_pools(
                 client,
                 a.as_ref(),
                 &candidates[i],
@@ -562,6 +598,7 @@ pub async fn run(
                 true, // bootstrap: fetch ticks
             )
             .await;
+            install_active_set(&mut active[i], new, complete, cache, registry);
         } else {
             metrics::set_dex_pools(metric_dex(a.label()), candidates[i].len());
         }
@@ -581,7 +618,7 @@ pub async fn run(
                     candidates[i] = ids;
                 }
                 if a.quotable() {
-                    active[i] = sync_pools(
+                    let (new, complete) = sync_pools(
                         client,
                         a.as_ref(),
                         &candidates[i],
@@ -593,6 +630,7 @@ pub async fn run(
                         true, // discovery: refetch ticks
                     )
                     .await;
+                    install_active_set(&mut active[i], new, complete, cache, registry);
                 }
             }
             last_discovery = Instant::now();
@@ -600,7 +638,7 @@ pub async fn run(
             // Fast path: refresh only the active set's state.
             for (i, a) in adapters.iter().enumerate() {
                 if a.quotable() && !active[i].is_empty() {
-                    active[i] = sync_pools(
+                    let (new, complete) = sync_pools(
                         client,
                         a.as_ref(),
                         &active[i],
@@ -612,6 +650,7 @@ pub async fn run(
                         false, // fast refresh: reuse cached ticks
                     )
                     .await;
+                    install_active_set(&mut active[i], new, complete, cache, registry);
                 }
             }
         }
@@ -659,5 +698,27 @@ mod tests {
     fn liquidity_proxy() {
         let v2 = PoolState::v2("0x1", Dex::Cetus, "A", "B", 500, 900, 30);
         assert_eq!(liquidity_of(&v2), 500);
+    }
+
+    #[test]
+    fn complete_active_refresh_evicts_removed_pool() {
+        let cache = Arc::new(ReserveCache::new());
+        cache.upsert(PoolState::v2("0xOLD", Dex::Cetus, "A", "B", 100, 100, 30));
+        let registry: LiveRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut old = vec!["0xOLD".to_string()];
+        install_active_set(&mut old, Vec::new(), true, &cache, &registry);
+        assert!(old.is_empty());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn partial_active_refresh_preserves_previous_membership() {
+        let cache = Arc::new(ReserveCache::new());
+        cache.upsert(PoolState::v2("0xOLD", Dex::Cetus, "A", "B", 100, 100, 30));
+        let registry: LiveRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let mut old = vec!["0xOLD".to_string()];
+        install_active_set(&mut old, Vec::new(), false, &cache, &registry);
+        assert_eq!(old, vec!["0xOLD".to_string()]);
+        assert!(cache.get("0xOLD").is_some());
     }
 }

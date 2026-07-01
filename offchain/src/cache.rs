@@ -28,6 +28,15 @@ impl ReserveCache {
             .insert(pool.id.clone(), pool);
     }
 
+    /// Remove a pool that is no longer in the indexer's authoritative active set.
+    /// Returning the removed snapshot makes lifecycle changes observable/testable.
+    pub fn remove(&self, id: &str) -> Option<PoolState> {
+        self.pools
+            .write()
+            .expect("reserve cache poisoned")
+            .remove(id)
+    }
+
     /// Update just the reserves of an existing V2 pool. Returns `false` if the pool
     /// is unknown or not a V2 pool (CLMM pools are refreshed via `upsert` of a freshly
     /// decoded snapshot — see `ws.rs`).
@@ -110,5 +119,7 @@ mod tests {
             }
         ));
         assert!(!c.update_reserves("0xUNKNOWN", 1, 1));
+        assert!(c.remove("0x1").is_some());
+        assert!(c.is_empty());
     }
 }

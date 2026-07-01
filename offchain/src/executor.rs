@@ -22,6 +22,7 @@
 //! keystore + live pools; not exercised in offline CI here.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::metrics;
@@ -123,6 +124,7 @@ pub async fn try_execute(
         let _t = metrics::stage_timer(metrics::Stage::DryRun);
         dry_run(client, &tx_data, &base_type, sender).await?
     };
+    let dry_run_at = Instant::now();
     metrics::inc_dry_run(dry.success);
     if !dry.success {
         tracing::warn!(?dry, "skip: dry-run reverted");
@@ -131,7 +133,11 @@ pub async fn try_execute(
         return Ok(Outcome::Skipped);
     }
     // Real gas from the dry-run; net is the base-coin balance change (nets gas for SUI base).
-    if dry.net_base < i128::from(config.min_profit) {
+    let effective_min = match opp.kind {
+        OppKind::Arb | OppKind::Backrun => config.effective_min_profit_mist(),
+        OppKind::Liquidation => config.min_profit,
+    };
+    if dry.net_base < i128::from(effective_min) {
         tracing::info!(
             net = dry.net_base,
             gas = dry.gas_used,
@@ -157,7 +163,6 @@ pub async fn try_execute(
             Ok(Outcome::Skipped)
         }
         Decision::Submit => {
-            metrics::add_predicted_net(dry.net_base);
             if !config.submit_enabled {
                 tracing::info!(
                     net_base = dry.net_base,
@@ -174,9 +179,11 @@ pub async fn try_execute(
                 &base_type,
                 sender,
                 guard,
+                dry.net_base,
                 net_usd,
                 base_decimals,
                 price_usd,
+                dry_run_at,
             )
             .await
         }
@@ -323,7 +330,8 @@ async fn build_ptb(
         &config.flash_version_id,
     )
     .ok_or_else(|| anyhow!("unknown flash provider '{}'", config.flash_provider))?;
-    let plan = crate::ptb::flash_arb_plan(provider.as_ref(), opp, config.min_profit);
+    let effective_min = config.effective_min_profit_mist();
+    let plan = crate::ptb::flash_arb_plan(provider.as_ref(), opp, effective_min);
 
     let clock = clock_arg();
     let cetus_cfg = objcache
@@ -381,7 +389,7 @@ async fn build_ptb(
         base_type,
         lender,
         amount: opp.input_amount,
-        min_profit: config.min_profit,
+        min_profit: effective_min,
         hops,
         sender,
         flash_style: style,
@@ -601,12 +609,13 @@ pub async fn try_execute_owned_sized(
         }
     }
 
-    // Stage 2: dry-run positive-expected sizes LARGEST-first; first success with
-    // net_base >= effective_min wins.
+    // Stage 2: dry-run positive-expected sizes BEST-EXPECTED-NET first; the first
+    // authoritative success wins. Largest-first can knowingly choose a worse trade
+    // after price impact, even when a smaller configured size has higher expected net.
     let gas_price = client.read_api().get_reference_gas_price().await?;
-    let mut winner: Option<(u64, TransactionData, i128)> = None;
+    let mut winner: Option<(u64, TransactionData, i128, Instant)> = None;
     let mut order: Vec<usize> = (0..sized.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(sized[i].size));
+    order.sort_by_key(|&i| std::cmp::Reverse(sized[i].expected_net));
     for i in order {
         if winner.is_some() || sized[i].expected_net <= 0 || sized[i].expected_out == 0 {
             continue;
@@ -649,6 +658,7 @@ pub async fn try_execute_owned_sized(
         let tx =
             TransactionData::new_programmable(sender, gas_coins, pt, config.gas_budget, gas_price);
         let dry = dry_run(client, &tx, &base_type, sender).await?;
+        let dry_run_at = Instant::now();
         sized[i].dry_success = dry.success;
         sized[i].dry_net_base = dry.net_base;
         sized[i].dry_gas = dry.gas_used;
@@ -658,7 +668,7 @@ pub async fn try_execute_owned_sized(
             sized[i].note = format!("below min_profit (net {} < {effective_min})", dry.net_base);
         } else {
             sized[i].note = "dry-run OK, profitable".into();
-            winner = Some((size, tx, dry.net_base));
+            winner = Some((size, tx, dry.net_base, dry_run_at));
         }
         tracing::info!(
             size,
@@ -672,7 +682,7 @@ pub async fn try_execute_owned_sized(
     }
 
     // Stage 3: submit the winner (only if enabled + risk allows).
-    if let Some((size, tx, net_base)) = winner {
+    if let Some((size, tx, net_base, dry_run_at)) = winner {
         let net_usd = mist_to_usd(net_base.max(0) as u64, base_decimals, price_usd);
         let pool_ids: Vec<&str> = route.iter().map(|h| h.pool_id.as_str()).collect();
         match guard.should_submit(net_usd, &pool_ids) {
@@ -689,9 +699,11 @@ pub async fn try_execute_owned_sized(
                         &base_type,
                         sender,
                         guard,
+                        net_base,
                         net_usd,
                         base_decimals,
                         price_usd,
+                        dry_run_at,
                     )
                     .await?;
                 } else {
@@ -941,9 +953,11 @@ async fn submit(
     base_type: &TypeTag,
     sender: SuiAddress,
     guard: &mut RiskGuard,
+    predicted_base: i128,
     predicted_usd: f64,
     base_decimals: u32,
     price_usd: f64,
+    dry_run_at: Instant,
 ) -> Result<Outcome> {
     use shared_crypto::intent::Intent;
     use std::path::PathBuf;
@@ -957,6 +971,22 @@ async fn submit(
     let sig = keystore
         .sign_secure(&sender, &tx_data, Intent::sui_transaction())
         .await?;
+
+    // The dry-run is our authoritative quote. Do not submit if signing/keystore
+    // latency made that quote older than the configured race window.
+    if dry_run_at.elapsed().as_millis() > u128::from(config.max_quote_age_ms) {
+        tracing::warn!(
+            age_ms = dry_run_at.elapsed().as_millis(),
+            max_age_ms = config.max_quote_age_ms,
+            "skip: authoritative dry-run quote expired before submit"
+        );
+        metrics::inc_rejected(metrics::Reject::RiskGuard);
+        guard.record_skip();
+        return Ok(Outcome::Skipped);
+    }
+    // Capture-ratio accounting must include only transactions that are actually
+    // about to be submitted. Dry-run-only and expired quotes have no realized leg.
+    metrics::add_predicted_net(predicted_base);
     let tx = Transaction::from_data(tx_data, vec![sig]);
 
     let opts = SuiTransactionBlockResponseOptions::new()

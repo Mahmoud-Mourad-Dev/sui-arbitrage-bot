@@ -558,6 +558,16 @@ mod live {
         hops: &[ResolvedHop],
         mut coin: Argument,
     ) -> Result<Argument> {
+        let swap_count = plan
+            .iter()
+            .filter(|s| matches!(s, PtbStep::Swap { .. }))
+            .count();
+        if swap_count != hops.len() {
+            bail!(
+                "plan/hop mismatch: plan has {swap_count} swaps, resolved hops has {}",
+                hops.len()
+            );
+        }
         for (step, hop) in plan
             .iter()
             .filter(|s| matches!(s, PtbStep::Swap { .. }))

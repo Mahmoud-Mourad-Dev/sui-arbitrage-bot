@@ -46,6 +46,8 @@ SUI_RPC_URL=https://fullnode.mainnet.sui.io:443
 SUI_WS_URL=wss://fullnode.mainnet.sui.io:443
 ARB_PACKAGE_ID=<from step 2>
 ARB_BASE_TOKEN=0x2::sui::SUI
+ARB_EXECUTION_MODE=owned        # simplest first live path; no lender dependency
+ARB_FLASH_ENABLED=false
 ARB_SENDER_ADDRESS=<your active-address>
 ARB_KEYSTORE_PATH=/Users/<you>/.sui/sui_config/sui.keystore
 ARB_TRACKED_POOLS=cetus:0x..,turbos:0x..     # ids from validation/cetus/mv_pools.json
@@ -56,6 +58,7 @@ ARB_GAS_BUDGET=30000000
 ARB_SUBMIT_ENABLED=false         # KEEP FALSE for Steps 4–5
 ARB_KILL_SWITCH=false
 ARB_MAX_DAILY_LOSS_USD=5
+ARB_SUI_PRICE_USD=<current operator price; required for USD risk accounting>
 ARB_LIQ_ENABLED=false            # liquidations not mainnet-ready yet
 ```
 > **Both venue ids above were verified against mainnet** (read-only `sui_getObject`):
